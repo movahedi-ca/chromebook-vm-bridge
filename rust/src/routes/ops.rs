@@ -1,7 +1,7 @@
 //! Ops route handlers: health, metrics, render_package.
 
 use crate::state::SharedState;
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{extract::State, response::IntoResponse, Json};
 use serde_json::json;
 
 /// GET /health — exempt from auth, but REDACTED (audit SEC-8).
@@ -27,7 +27,7 @@ pub async fn health(State(state): State<SharedState>) -> impl IntoResponse {
     }))
 }
 
-/// GET /metrics — operational counters (replaces Python _metrics dict).
+/// GET /metrics — operational counters (replaces legacy metrics dict).
 pub async fn metrics(State(state): State<SharedState>) -> impl IntoResponse {
     let m = state.metrics.lock().await;
     Json(json!({
