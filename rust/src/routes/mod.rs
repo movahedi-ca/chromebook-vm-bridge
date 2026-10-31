@@ -1,9 +1,12 @@
 //! Route handlers.
 
+pub mod advanced;
 pub mod browser;
+pub mod input;
 pub mod lease;
 pub mod ops;
 pub mod pool;
+pub mod read;
 
 use crate::state::SharedState;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
@@ -20,6 +23,8 @@ pub async fn not_implemented(name: &str) -> impl IntoResponse {
 }
 
 /// Helper: require the browser to be alive, else 503.
+#[allow(dead_code)] // shared guard for future handlers; no caller yet (audit LOW-1)
+#[allow(clippy::result_large_err)] // axum Response is large by design; not worth boxing
 pub async fn require_browser(state: &SharedState) -> Result<(), axum::response::Response> {
     if state.browser1.lock().await.is_alive() {
         Ok(())
