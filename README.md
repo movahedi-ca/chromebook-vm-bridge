@@ -31,6 +31,7 @@ an SSH tunnel or the tailnet proxy.
 | `human_mouse.py` | Eased mouse trajectories (Mona Lisa smoothness-gated) |
 | `vm-bridge.service` | systemd unit (localhost:8899, auto-restart, watchdog) |
 | `docs/chromebook-vm-setup.md` | The host VM's overall setup: hardware, display, services, secrets handling |
+| `agent/` | Orchestrator-side tooling: hardened SSH wrapper, job protocol, rsync transfer, typed bridge CLI (no secrets; host via `CB_HOST`) |
 | `rust/` | Rust rewrite (axum + tokio): scoped keys, SSRF firewall, perception plane, MCP server |
 
 ## Setup
