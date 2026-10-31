@@ -1,7 +1,10 @@
 //! Middleware stack (audit SEC-4, SEC-5).
 //!
-//! Layer order (outermost first): rate_limit → auth → body_cap → handler.
+//! Layer order (outermost first): timeout → rate_limit → auth → lease →
+//! body_cap → log → handler. (Registered innermost-first: axum applies the
+//! LAST .layer() call as the outermost wrapper.)
 //! Rate limiting BEFORE auth so brute-force attempts consume tokens.
+//! The timeout layer bounds total request time (audit HIGH-5).
 //! Body caps count actual bytes streamed (not Content-Length header),
 //! closing the chunked-encoding bypass. Gzip decompresses with a hard
 //! output cap, applied uniformly to all endpoints.
@@ -19,41 +22,57 @@ use futures_util::StreamExt;
 use serde_json::json;
 use std::time::Duration;
 
-/// Pre-auth rate limiting, keyed by (client_ip, route_template).
-/// Route templates (not raw paths) prevent 404-scan map growth (audit §5.3).
+/// Pre-auth rate limiting, keyed by (client_identity, raw_path).
+///
+/// NOTE: this middleware runs as a `Router::layer`, i.e. BEFORE route
+/// matching, so `MatchedPath` is never populated here — the key always
+/// uses the raw request path (audit HIGH-4). Unbounded growth from
+/// 404-scan path variants is contained by the idle-bucket eviction
+/// below (cap 10k entries, 120s idle TTL).
+///
+/// Client identity is a hash of the presented `x-api-key` when present
+/// (all production clients arrive through one tailnet tunnel IP, so IP
+/// keying would let one client's burst throttle everyone else), else
+/// the socket IP. Runs before auth, so brute-force attempts consume
+/// tokens too.
 pub async fn rate_limit_middleware(
     State(state): State<SharedState>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    let ip = req
-        .extensions()
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|c| c.0.ip().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let template = req
-        .extensions()
-        .get::<axum::extract::MatchedPath>()
-        .map(|m| m.as_str().to_string())
-        .unwrap_or_else(|| req.uri().path().to_string());
+    let identity = client_identity(&req);
+    let path = req.uri().path().to_string();
 
-    // Per-(ip, template) bucket: 30 req/min sustained, burst 10.
-    // Auth failures share the same bucket (they arrive here first).
-    let key = (ip.clone(), template.clone());
+    // Per-(identity, path) bucket: 30 req/min sustained, burst 10
+    // (governor's default burst equals the rate; allow_burst pins it
+    // to the documented contract).
+    let key = (identity.clone(), path.clone());
     let allowed = {
         let mut buckets = state.rate_buckets.lock().await;
-        let limiter = buckets.entry(key).or_insert_with(|| {
-            governor::RateLimiter::direct(governor::Quota::per_minute(
-                std::num::NonZeroU32::new(30).unwrap(),
-            ))
+        let now = std::time::Instant::now();
+        // Bound memory: evict buckets idle longer than 120s once the
+        // map grows past 10k entries (audit HIGH-4).
+        if buckets.len() > 10_000 {
+            buckets.retain(|_, (_, last_seen)| {
+                now.duration_since(*last_seen) < Duration::from_secs(120)
+            });
+        }
+        let entry = buckets.entry(key).or_insert_with(|| {
+            (
+                governor::RateLimiter::direct(
+                    governor::Quota::per_minute(std::num::NonZeroU32::new(30).unwrap())
+                        .allow_burst(std::num::NonZeroU32::new(10).unwrap()),
+                ),
+                now,
+            )
         });
-        limiter.check().is_ok()
+        entry.1 = now;
+        entry.0.check().is_ok()
     };
 
     if !allowed {
-        tracing::warn!(%ip, template = %template, "rate limit exceeded");
+        tracing::warn!(identity = %identity, path = %path, "rate limit exceeded");
         state.metrics.lock().await.rejections_429 += 1;
-        // Best-effort cleanup of idle buckets to bound memory
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(json!({"ok": false, "error": "rate_limited", "retry_after_s": 60})),
@@ -64,6 +83,27 @@ pub async fn rate_limit_middleware(
     next.run(req).await
 }
 
+/// Stable per-client identity for rate limiting. Prefers a hash of the
+/// presented API key (never the key material itself); falls back to the
+/// socket IP for keyless requests.
+fn client_identity(req: &Request<Body>) -> String {
+    if let Some(k) = req
+        .headers()
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+    {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        k.hash(&mut h);
+        return format!("key:{:016x}", h.finish());
+    }
+    req.extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| format!("ip:{}", c.0.ip()))
+        .unwrap_or_else(|| "ip:unknown".to_string())
+}
+
 /// Body cap: counts ACTUAL bytes streamed through the body, defeating the
 /// chunked-Transfer-Encoding Content-Length bypass (audit SEC-5).
 pub async fn body_cap_middleware(
@@ -72,7 +112,7 @@ pub async fn body_cap_middleware(
     next: Next,
 ) -> Response {
     let max = state.config.max_body_bytes;
-    let (mut parts, body) = req.into_parts();
+    let (parts, body) = req.into_parts();
 
     let mut stream = body.into_data_stream();
     let mut total: usize = 0;
@@ -152,13 +192,71 @@ async fn decompress_capped(input: &[u8], max_out: usize) -> Result<Vec<u8>, Stri
     Ok(out)
 }
 
+/// Lease enforcement: when a lease is held, mutating requests to browser #1
+/// need the matching X-Lease-Id header or the bridge answers 423.
+/// Reads never need a lease. Pool paths are exempt (separate browser).
+pub async fn lease_middleware(
+    State(state): State<SharedState>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let is_mutating = matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
+    let exempt = path == "/lease/acquire"
+        || path == "/lease/release"
+        || path == "/lease/renew"
+        || path.starts_with("/pool/");
+
+    if is_mutating && !exempt {
+        let allowed = {
+            let mut leases = state.leases.lock().await;
+            if !leases.locked() {
+                true
+            } else {
+                let presented = req
+                    .headers()
+                    .get("x-lease-id")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                leases.check(presented)
+            }
+        };
+        if !allowed {
+            state.metrics.lock().await.rejections_423 += 1;
+            return (
+                StatusCode::LOCKED,
+                Json(json!({"ok": false, "error": "browser leased by another client"})),
+            )
+                .into_response();
+        }
+    }
+
+    next.run(req).await
+}
+
 /// Request logging with timing. Rejections logged by inner layers.
-pub async fn log_middleware(req: Request<Body>, next: Next) -> Response {
+/// Also the metrics hook (audit MED-5): counts every request and every
+/// 4xx/5xx response here, the one place the final status is known.
+pub async fn log_middleware(
+    State(state): State<SharedState>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
     let start = std::time::Instant::now();
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let resp = next.run(req).await;
     let elapsed = start.elapsed();
+    {
+        let mut m = state.metrics.lock().await;
+        m.requests_total += 1;
+        match resp.status().as_u16() {
+            400..=499 => m.requests_4xx += 1,
+            500..=599 => m.requests_5xx += 1,
+            _ => {}
+        }
+    }
     tracing::info!(
         method = %method,
         path = %path,
