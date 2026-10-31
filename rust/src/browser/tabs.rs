@@ -10,8 +10,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// JS to install on every new document: FormGuard + diff observer.
+///
+/// NOTE (audit HIGH-2): FormGuard is currently DISABLED. The receiving
+/// route (`/internal/checkpoint`) does not exist yet and the injected
+/// fetch would fire doomed requests (console noise + CSP risk) on every
+/// page. Re-enable by uncommenting below AND registering the internal
+/// route with the ACT key injected as a closure variable.
+#[allow(dead_code)] // parked scaffolding until HIGH-2 is properly implemented
 pub const NEW_DOCUMENT_SCRIPTS: &[&str] = &[
-    crate::vault::FORMGUARD_JS,
+    // crate::vault::FORMGUARD_JS, // disabled until /internal/checkpoint exists
     // Diff observer installed by perception::diff::DIFF_INSTALL_JS
 ];
 
@@ -22,11 +29,10 @@ pub async fn wait_for_x11(dpy: &str) -> anyhow::Result<()> {
     while tokio::time::Instant::now() < deadline {
         // Try to connect via x11rb (blocking — run in spawn_blocking)
         let dpy_owned = dpy.to_string();
-        let ok = tokio::task::spawn_blocking(move || {
-            x11rb::connect(Some(dpy_owned.as_str())).is_ok()
-        })
-        .await
-        .unwrap_or(false);
+        let ok =
+            tokio::task::spawn_blocking(move || x11rb::connect(Some(dpy_owned.as_str())).is_ok())
+                .await
+                .unwrap_or(false);
         if ok {
             tracing::info!("X11 display {} ready", dpy);
             return Ok(());
