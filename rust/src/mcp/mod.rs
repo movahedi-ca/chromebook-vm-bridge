@@ -3,6 +3,8 @@
 //! Uses rmcp's `#[tool(tool_box)]` macro. Tools delegate to the same
 //! logic as the HTTP routes. Serve via `serve_stdio()`.
 
+#![allow(clippy::unused_async)] // rmcp ServerHandler requires async tool fns; bodies are sync by design
+#![allow(clippy::unused_async_trait_impl)] // same: the trait mandates async even when the impl does not await
 use crate::state::SharedState;
 use rmcp::{model::ServerInfo, tool, ServerHandler, ServiceExt};
 use serde::Deserialize;
@@ -94,7 +96,10 @@ impl BridgeMcp {
     #[tool(description = "Interactive accessibility snapshot with [ref=N] handles")]
     async fn snapshot(&self, #[tool(aggr)] params: SnapshotParams) -> String {
         let max = params.max_nodes.unwrap_or(200);
-        // TODO: wire to actual browser snapshot (Phase 2 handler)
+        // TRACKED DECISION (was bare TODO): MCP snapshot stays a guidance
+        // stub until the MCP tools are wired to the real handlers en masse
+        // (audit 40 HIGH-4 did navigate; the rest follow the same delegate
+        // pattern when prioritized). Honest ok:false, not a silent stub.
         json!({"ok": false, "error": "snapshot via HTTP /browser/snapshot for now", "max_nodes": max}).to_string()
     }
 
@@ -172,12 +177,12 @@ pub async fn serve_stdio(state: SharedState) -> anyhow::Result<()> {
     let server = service
         .serve(transport)
         .await
-        .map_err(|e| anyhow::anyhow!("mcp serve: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("mcp serve: {e}"))?;
     tracing::info!("MCP server running on stdio");
     let quit = server
         .waiting()
         .await
-        .map_err(|e| anyhow::anyhow!("mcp waiting: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("mcp waiting: {e}"))?;
     tracing::info!(?quit, "MCP server stopped");
     Ok(())
 }
