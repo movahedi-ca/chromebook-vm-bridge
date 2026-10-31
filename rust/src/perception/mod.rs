@@ -1,6 +1,6 @@
 //! Interactive accessibility snapshot with `[ref=N]` handles (playbook §9).
 //!
-//! Fixes vs. Python (audit M3): the old `_ax_snapshot` filter,
+//! Fixes vs. the legacy implementation (audit M3): the old `_ax_snapshot` filter,
 //! `role in interesting or (name and role)`, was effectively a no-op.
 //! Nearly every named DOM node (StaticText, generic, paragraph, image)
 //! satisfied it, so the 200-node cap filled with static header and body
@@ -63,11 +63,11 @@ pub const AX_SNAPSHOT_CAP: usize = 200;
 /// sync. Rust-side code (tests, validators, future CDP
 /// `Accessibility.getFullAXTree` consumers) must apply exactly the same
 /// allowlist as the in-page script.
+#[allow(dead_code)] // parked: used by the unwired SoM path (audit LOW-1)
 pub fn filter_interactive(roles: &[&str]) -> bool {
     roles.iter().any(|role| {
         let lower = role.trim().to_ascii_lowercase();
-        INTERACTIVE_ROLES.contains(&lower.as_str())
-            || CONTEXT_ROLES.contains(&lower.as_str())
+        INTERACTIVE_ROLES.contains(&lower.as_str()) || CONTEXT_ROLES.contains(&lower.as_str())
     })
 }
 
@@ -113,6 +113,7 @@ impl AxMapper {
 
     /// Resolve a `[ref]` to its `backendDOMNodeId`, or `None` when unknown
     /// (e.g. a ref from a previous page load after [`AxMapper::clear`]).
+    #[allow(dead_code)] // parked: ref-resolution for the unwired MCP click/fill path
     pub fn resolve(&self, ref_id: u32) -> Option<i64> {
         self.forward.get(&ref_id).copied()
     }
@@ -125,11 +126,13 @@ impl AxMapper {
     }
 
     /// Number of mapped refs.
+    #[allow(dead_code)] // part of the public mapper API; no caller yet
     pub fn len(&self) -> usize {
         self.forward.len()
     }
 
     /// True when no refs are mapped.
+    #[allow(dead_code)] // part of the public mapper API; no caller yet
     pub fn is_empty(&self) -> bool {
         self.forward.is_empty()
     }
@@ -156,6 +159,7 @@ impl AxMapper {
 ///   `/browser/upload` resolves those via CDP directly.
 /// - Accessible name order: `aria-labelledby`, `aria-label`, associated
 ///   `<label>`, text content, then `placeholder`/`title`/`alt`/`value`.
+#[allow(dead_code)] // parked: JS snapshot path superseded by the Rust AX walker (audit LOW-1)
 pub const AX_SNAPSHOT_JS: &str = r##"(() => {
   const CAP = 200;
   // Mirrors perception::filter_interactive (Rust). Keep in sync.
@@ -292,8 +296,20 @@ mod tests {
     #[test]
     fn allowlist_accepts_interactive_roles_and_headings() {
         for role in [
-            "button", "link", "textbox", "searchbox", "combobox", "listbox", "option",
-            "checkbox", "radio", "tab", "menuitem", "spinbutton", "slider", "heading",
+            "button",
+            "link",
+            "textbox",
+            "searchbox",
+            "combobox",
+            "listbox",
+            "option",
+            "checkbox",
+            "radio",
+            "tab",
+            "menuitem",
+            "spinbutton",
+            "slider",
+            "heading",
         ] {
             assert!(filter_interactive(&[role]), "role '{role}' should pass");
         }
@@ -303,8 +319,19 @@ mod tests {
     fn allowlist_rejects_static_roles() {
         // Audit M3: these node kinds filled the old 200-node cap in document
         // order before any interactive control was reached.
-        for role in ["div", "generic", "paragraph", "StaticText", "image", "banner", ""] {
-            assert!(!filter_interactive(&[role]), "role '{role}' should be rejected");
+        for role in [
+            "div",
+            "generic",
+            "paragraph",
+            "StaticText",
+            "image",
+            "banner",
+            "",
+        ] {
+            assert!(
+                !filter_interactive(&[role]),
+                "role '{role}' should be rejected"
+            );
         }
         assert!(!filter_interactive(&[]), "empty slice must not pass");
     }
@@ -363,12 +390,18 @@ mod tests {
 
     #[test]
     fn snapshot_js_has_required_shape() {
-        assert!(AX_SNAPSHOT_JS.contains("truncated"), "must return truncated flag");
+        assert!(
+            AX_SNAPSHOT_JS.contains("truncated"),
+            "must return truncated flag"
+        );
         assert!(
             AX_SNAPSHOT_JS.contains("aria-hidden"),
             "must skip ignored subtrees"
         );
         assert!(AX_SNAPSHOT_JS.contains("CAP"), "must enforce the node cap");
-        assert!(AX_SNAPSHOT_JS.contains("iframe"), "must descend into frames");
+        assert!(
+            AX_SNAPSHOT_JS.contains("iframe"),
+            "must descend into frames"
+        );
     }
 }
