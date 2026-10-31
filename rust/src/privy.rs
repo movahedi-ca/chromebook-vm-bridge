@@ -11,6 +11,7 @@ use regex::Regex;
 use std::sync::OnceLock;
 
 /// JS: remove deceptive nodes before serialization. Returns count removed.
+#[allow(dead_code)] // parked: sanitizer for a future snapshot pipeline (audit LOW-1)
 pub const SANITIZE_JS: &str = r#"
 (function() {
   let removed = 0;
@@ -37,8 +38,10 @@ pub const SANITIZE_JS: &str = r#"
 })();
 "#;
 
+#[allow(dead_code)] // parked: PII redactor not yet wired into any route (audit LOW-1)
 static PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
 
+#[allow(dead_code)] // parked: PII redactor not yet wired into any route (audit LOW-1)
 fn patterns() -> &'static Vec<(Regex, &'static str)> {
     PATTERNS.get_or_init(|| {
         vec![
@@ -72,15 +75,15 @@ fn patterns() -> &'static Vec<(Regex, &'static str)> {
 }
 
 /// Redact PII/secrets from text. Returns (redacted_text, redaction_count).
+#[allow(dead_code)] // parked: PII redactor not yet wired into any route (audit LOW-1)
 pub fn redact(text: &str) -> (String, usize) {
     let mut out = text.to_string();
     let mut count = 0;
     for (re, token) in patterns() {
-        let new = re.replace_all(&out, *token).into_owned();
-        if new.len() != out.len() {
-            count += 1;
-        }
-        out = new;
+        // Count actual matches (audit LOW-5): the old length-diff heuristic
+        // undercounted multi-match patterns and missed same-length swaps.
+        count += re.find_iter(&out).count();
+        out = re.replace_all(&out, *token).into_owned();
     }
     (out, count)
 }
@@ -88,7 +91,14 @@ pub fn redact(text: &str) -> (String, usize) {
 /// URL firewall for navigation (audit SEC-6).
 /// Allows only http/https; blocks loopback, link-local, private ranges,
 /// and cloud metadata IPs after DNS resolution unless allowlisted.
-pub fn validate_navigate_url(raw: &str, allowlist: &[String]) -> Result<url::Url, String> {
+///
+/// KNOWN GAP (audit MED-2): DNS-rebinding TOCTOU. We resolve the host in
+/// Rust, then Chrome resolves it again at navigate time — a rebinding
+/// attacker can serve a benign IP to us and a private IP to Chrome.
+/// Fully closing this requires navigating by literal resolved IP with a
+/// Host-header rewrite, which breaks TLS SNI/virtual hosting; accepted
+/// as a documented residual risk for a single-operator bridge.
+pub async fn validate_navigate_url(raw: &str, allowlist: &[String]) -> Result<url::Url, String> {
     let parsed = url::Url::parse(raw).map_err(|e| format!("invalid URL: {}", e))?;
     match parsed.scheme() {
         "http" | "https" => {}
@@ -102,19 +112,24 @@ pub fn validate_navigate_url(raw: &str, allowlist: &[String]) -> Result<url::Url
     // Block by literal IP
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         if is_blocked_ip(&ip) {
-            return Err(format!("IP {} is blocked (loopback/link-local/private)", ip));
+            return Err(format!(
+                "IP {} is blocked (loopback/link-local/private)",
+                ip
+            ));
         }
         return Ok(parsed);
     }
-    // DNS-resolve and check all returned IPs
-    match dns_resolve(host) {
+    // DNS-resolve and check all returned IPs. Resolution is blocking
+    // std I/O — run it off the tokio worker (audit MED-2).
+    let host_owned = host.to_string();
+    let resolved = tokio::task::spawn_blocking(move || dns_resolve(&host_owned))
+        .await
+        .map_err(|e| format!("DNS task failed: {e}"))?;
+    match resolved {
         Ok(ips) => {
             for ip in ips {
                 if is_blocked_ip(&ip) {
-                    return Err(format!(
-                        "host {} resolves to blocked IP {}",
-                        host, ip
-                    ));
+                    return Err(format!("host {} resolves to blocked IP {}", host, ip));
                 }
             }
             Ok(parsed)
@@ -123,15 +138,33 @@ pub fn validate_navigate_url(raw: &str, allowlist: &[String]) -> Result<url::Url
     }
 }
 
+/// Normalize IPv4-mapped IPv6 (`::ffff:10.0.0.1`) to plain IPv4 so the
+/// blocklist below can't be bypassed with a mapped address (audit MED-2).
+fn normalize(ip: std::net::IpAddr) -> std::net::IpAddr {
+    if let std::net::IpAddr::V6(v6) = ip {
+        if let Some(v4) = v6.to_ipv4_mapped() {
+            return std::net::IpAddr::V4(v4);
+        }
+    }
+    ip
+}
+
 fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
+    let ip = normalize(*ip);
     match ip {
         std::net::IpAddr::V4(v4) => {
             v4.is_loopback() || v4.is_link_local() || v4.is_private()
+            || v4.is_unspecified() || v4.is_multicast()
             // 169.254.169.254 (cloud metadata) is link-local → blocked
             // 100.64.0.0/10 (CGNAT) — check manually
             || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b11000000) == 0b01000000)
         }
-        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unicast_link_local(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unicast_link_local()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+        }
     }
 }
 
@@ -147,24 +180,32 @@ fn dns_resolve(host: &str) -> Result<Vec<std::net::IpAddr>, String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn blocks_file_scheme() {
-        assert!(validate_navigate_url("file:///etc/passwd", &[]).is_err());
+    #[tokio::test]
+    async fn blocks_file_scheme() {
+        assert!(validate_navigate_url("file:///etc/passwd", &[])
+            .await
+            .is_err());
     }
 
-    #[test]
-    fn blocks_loopback() {
-        assert!(validate_navigate_url("http://127.0.0.1:8899/", &[]).is_err());
+    #[tokio::test]
+    async fn blocks_loopback() {
+        assert!(validate_navigate_url("http://127.0.0.1:8899/", &[])
+            .await
+            .is_err());
     }
 
-    #[test]
-    fn blocks_metadata() {
-        assert!(validate_navigate_url("http://169.254.169.254/", &[]).is_err());
+    #[tokio::test]
+    async fn blocks_metadata() {
+        assert!(validate_navigate_url("http://169.254.169.254/", &[])
+            .await
+            .is_err());
     }
 
-    #[test]
-    fn allows_https() {
-        assert!(validate_navigate_url("https://example.com/", &[]).is_ok());
+    #[tokio::test]
+    async fn allows_https() {
+        assert!(validate_navigate_url("https://example.com/", &[])
+            .await
+            .is_ok());
     }
 
     #[test]
