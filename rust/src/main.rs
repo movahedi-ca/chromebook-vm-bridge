@@ -40,19 +40,34 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // JSON logging to stdout (journald picks it up)
-    tracing_subscriber::registry()
-        .with(fmt::layer().json())
-        .with(EnvFilter::from_default_env())
-        .init();
+    // NOTE: in --mcp-stdio mode, logs go to stderr to keep stdout clean for JSON-RPC
+    let mcp_stdio = std::env::args().any(|a| a == "--mcp-stdio");
+    if mcp_stdio {
+        tracing_subscriber::registry()
+            .with(fmt::layer().json().with_writer(std::io::stderr))
+            .with(EnvFilter::from_default_env())
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(fmt::layer().json())
+            .with(EnvFilter::from_default_env())
+            .init();
+    }
 
     let config = Config::load()?;
+    let state: SharedState = Arc::new(BridgeState::new(config.clone()));
+
+    // MCP stdio mode: skip HTTP server, serve MCP directly
+    if mcp_stdio {
+        tracing::info!("starting in MCP stdio mode");
+        return crate::mcp::serve_stdio(state).await;
+    }
+
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         bind = format!("{}:{}", config.bind_addr, config.bind_port),
         "vm-bridge starting"
     );
-
-    let state: SharedState = Arc::new(BridgeState::new(config.clone()));
 
     // Ensure artifact dirs exist with mode 700 (audit SEC-8)
     for dir in [&config.failure_dir, &config.trace_dir] {
