@@ -61,6 +61,24 @@ pub struct EvalParams {
     pub js: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BatchExecuteParams {
+    #[schemars(
+        description = "Steps to run in order; each {action, params}. Actions: navigate, click, fill, type, press, scroll, wait, drag, double_click, snapshot, text, html, order. (eval/script NOT batchable.)"
+    )]
+    pub steps: Vec<BatchStepParam>,
+    #[schemars(description = "Stop at the first failed step (default true)")]
+    pub abort_on_error: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BatchStepParam {
+    #[schemars(description = "Action name, e.g. navigate")]
+    pub action: String,
+    #[schemars(description = "Action params object, e.g. {\"url\": \"https://...\"}")]
+    pub params: serde_json::Value,
+}
+
 /// Whether the MCP process environment authorizes browser tools
 /// (audit 42 High-9).
 ///
@@ -113,7 +131,12 @@ impl BridgeMcp {
         // this tool actually navigates now instead of merely validating.
         let resp = crate::routes::browser::navigate(
             axum::extract::State(self.state.clone()),
-            axum::Json(crate::routes::browser::NavigateRequest { url: params.url }),
+            axum::Json(crate::routes::browser::NavigateRequest {
+                url: params.url,
+                // MCP navigate keeps the default lifecycle ("networkidle"
+                // == historical `page.goto()` behavior).
+                wait_until: String::new(),
+            }),
         )
         .await
         .into_response();
@@ -174,6 +197,39 @@ impl BridgeMcp {
                 json!({"ok": true, "path": p.to_string_lossy(), "ref": params.r#ref}).to_string()
             }
             Err(e) => json!({"ok": false, "error": e.to_string()}).to_string(),
+        }
+    }
+
+    #[tool(
+        description = "Run N browser actions in one call (navigate/click/fill/type/press/scroll/wait/drag/double_click/snapshot/text/html/order). Delegates to HTTP POST /browser/batch; eval/script are NOT batchable."
+    )]
+    async fn batch_execute(&self, #[tool(aggr)] params: BatchExecuteParams) -> String {
+        use axum::response::IntoResponse;
+        if !mcp_env_authorized() {
+            return mcp_auth_refusal("batch_execute");
+        }
+        // Delegate to the HTTP /browser/batch handler: identical
+        // behavior, validation, and abort_on_error policy.
+        let steps: Vec<crate::routes::batch::BatchStep> = params
+            .steps
+            .into_iter()
+            .map(|s| crate::routes::batch::BatchStep {
+                action: s.action,
+                params: s.params,
+            })
+            .collect();
+        let resp = crate::routes::batch::batch(
+            axum::extract::State(self.state.clone()),
+            axum::Json(crate::routes::batch::BatchReq {
+                steps,
+                abort_on_error: params.abort_on_error.unwrap_or(true),
+            }),
+        )
+        .await
+        .into_response();
+        match axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024).await {
+            Ok(b) => String::from_utf8_lossy(&b).to_string(),
+            Err(e) => json!({"ok": false, "error": format!("batch response: {e}")}).to_string(),
         }
     }
 
