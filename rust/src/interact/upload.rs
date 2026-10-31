@@ -85,7 +85,7 @@ pub const UPLOAD_STAGE1_JS: &str = r#"() => {
 /// the full `dragenter` → `dragover` → `drop` sequence onto the container.
 /// Returns `true` when the drop event was dispatched.
 #[allow(dead_code)] // parked: stage-3 upload path not yet wired (audit LOW-1)
-pub const UPLOAD_STAGE3_JS: &str = r#"(container, fileName, mimeType, base64Data) => {
+pub const UPLOAD_STAGE3_JS: &str = r"(container, fileName, mimeType, base64Data) => {
     const bytes = Uint8Array.from(atob(base64Data), (c) => c.charCodeAt(0));
     const file = new File([bytes], fileName, { type: mimeType });
     const dt = new DataTransfer();
@@ -95,7 +95,7 @@ pub const UPLOAD_STAGE3_JS: &str = r#"(container, fileName, mimeType, base64Data
     container.dispatchEvent(new DragEvent('dragover', opts));
     container.dispatchEvent(new DragEvent('drop', opts));
     return true;
-}"#;
+}";
 
 /// Validate an upload path against the staging allowlist.
 ///
@@ -111,11 +111,9 @@ pub fn validate_upload_path(path: &str, allowlist: &[PathBuf]) -> anyhow::Result
     let canonical = Path::new(path)
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("upload path not accessible: {path} ({e})"))?;
-    let inside = allowlist.iter().any(|dir| {
-        dir.canonicalize()
-            .map(|d| canonical.starts_with(d))
-            .unwrap_or(false)
-    });
+    let inside = allowlist
+        .iter()
+        .any(|dir| dir.canonicalize().is_ok_and(|d| canonical.starts_with(d)));
     if !inside {
         return Err(anyhow::anyhow!(
             "upload path escapes allowlist: {}",
