@@ -8,12 +8,12 @@
 //!   `tokio::task::spawn_blocking`.
 //! - `query_pointer()` runs **before every trajectory** (fixes the stale
 //!   `_CUR_X`/`_CUR_Y` cache that desynced on the watched VNC display).
-//! - Bezier curves for moves down to 15px (Python skipped <200px).
+//! - Bezier curves for moves down to 15px (legacy skipped <200px).
 //! - Adaptive subdivision terminates on flatness **and** a 12px chord cap
 //!   (fixes straight-line teleportation).
 //! - Easing is applied by **arc length**, not point index.
 //! - Real `smoothness_score` returning `(score_deg, max_deviation_px)`
-//!   (Python returned a hardcoded `0.0` stub for the deviation).
+//!   (legacy returned a hardcoded `0.0` stub for the deviation).
 //! - **SEC-1:** coordinates outside the verified Chrome window rect are
 //!   REJECTED with an error. The driver never clicks the raw desktop.
 //!   Rejection (not clamping) is deliberate: silently moving a click target
@@ -165,6 +165,7 @@ fn dist_point_to_segment(p: Pt, a: Pt, b: Pt) -> f64 {
 }
 
 /// Cubic Bezier evaluation (de Casteljau form).
+#[allow(dead_code)] // parked: used by the unwired smooth-drag path (audit LOW-1)
 fn bez(p0: Pt, p1: Pt, p2: Pt, p3: Pt, t: f64) -> Pt {
     let m = 1.0 - t;
     (
@@ -188,7 +189,7 @@ fn subdivide(p0: Pt, p1: Pt, p2: Pt, p3: Pt) -> (Cubic, Cubic) {
 }
 
 /// Adaptive subdivision. Terminates when the segment is BOTH flat within
-/// tolerance AND no longer than `MAX_CHORD_PX` (the audit fix: Python only
+/// tolerance AND no longer than `MAX_CHORD_PX` (the audit fix: the legacy only
 /// checked flatness, letting long straight runs collapse into teleports),
 /// or at max depth. Appends points after `p0` into `out`.
 fn adaptive_points(p0: Pt, p1: Pt, p2: Pt, p3: Pt, depth: u32, out: &mut Vec<Pt>) {
@@ -395,7 +396,7 @@ impl X11Mouse {
     }
 
     /// Emit a trajectory with slow-fast-slow easing applied by ARC LENGTH
-    /// (the audit fix: Python eased by point index, distorting velocity on
+    /// (the audit fix: the legacy eased by point index, distorting velocity on
     /// non-uniform polylines). Ends exactly on the final point.
     fn emit_trajectory(
         &self,
@@ -431,6 +432,7 @@ impl X11Mouse {
 
     /// Move the visible cursor to (x, y) along a human-like path.
     /// Synchronous blocking X11 I/O — call via `spawn_blocking`.
+    #[allow(dead_code)] // parked: visible-move for a future visible-drag path (audit LOW-1)
     pub fn move_to(&self, x: i32, y: i32) -> Result<()> {
         self.check(x, y)?;
         let mut rng = self.rng();
@@ -463,8 +465,9 @@ impl X11Mouse {
     }
 
     /// Human double-click: single trajectory, then two presses spaced
-    /// 45–75ms apart (inside the OS double-click threshold; Python's
+    /// 45–75ms apart (inside the OS double-click threshold; the legacy
     /// 230–380ms total exceeded it and never registered as a double-click).
+    #[allow(dead_code)] // parked: visible double-click for a future visible path (audit LOW-1)
     pub fn double_click(&self, x: i32, y: i32) -> Result<()> {
         self.check(x, y)?;
         let mut rng = self.rng();
@@ -490,6 +493,7 @@ impl X11Mouse {
     /// Human drag from (x1,y1) to (x2,y2): move, press, trace with hand
     /// wobble, release. Wobble is dropped per-point if it would leave the
     /// window rect (endpoints are strictly validated).
+    #[allow(dead_code)] // parked: visible drag for a future visible path (audit LOW-1)
     pub fn drag(&self, x1: i32, y1: i32, x2: i32, y2: i32) -> Result<()> {
         self.check(x1, y1)?;
         self.check(x2, y2)?;
@@ -514,7 +518,7 @@ impl X11Mouse {
         let seg_ang =
             (y2 as f64 - y1 as f64).atan2(x2 as f64 - x1 as f64) + std::f64::consts::FRAC_PI_2;
         let (wx, wy) = (seg_ang.cos(), seg_ang.sin());
-        // Draw at ~750 px/s like the Python driver.
+        // Draw at ~750 px/s like the legacy driver.
         let step_time = (RESAMPLE_SPACING_PX / 750.0).max(0.002);
         for (i, &p) in stroke.iter().enumerate() {
             let t = i as f64 / (stroke.len() - 1).max(1) as f64;
@@ -544,7 +548,8 @@ impl X11Mouse {
     /// - turning angle: max direction change between consecutive segments;
     ///   smooth curves stay under ~8°, polygonal output spikes past 20°.
     /// - deviation: max perpendicular distance of interior points from the
-    ///   straight chord start→end (the metric Python left as a `0.0` stub).
+    ///   straight chord start→end (the metric the legacy left as a `0.0` stub).
+    #[allow(dead_code)] // parked: trajectory-quality metric for a future visible path (audit LOW-1)
     pub fn smoothness_score(points: &[(f64, f64)]) -> (f64, f64) {
         if points.len() < 3 {
             return (0.0, 0.0);
