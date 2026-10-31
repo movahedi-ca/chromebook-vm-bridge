@@ -6,7 +6,7 @@
 //! 3. Run the CDP/JS operation with timeout
 //! 4. Return JSON with token-efficient shapes
 
-use crate::browser::actions::install_blocked_url_patterns;
+use crate::browser::actions::{install_blocked_url_patterns, navigate_with_mode, NavWaitMode};
 use crate::browser::tabs::ensure_browser;
 use crate::routes::not_implemented;
 use crate::routes::read::{capture_png, page_url_title};
@@ -19,6 +19,10 @@ use std::time::Duration;
 #[derive(Debug, Deserialize)]
 pub struct NavigateRequest {
     pub url: String,
+    /// Lifecycle wait mode: "networkidle" (default — historical
+    /// `page.goto()` behavior), "load", "domcontentloaded", "commit".
+    #[serde(default)]
+    pub wait_until: String,
 }
 
 /// POST /browser/navigate — SSRF-filtered navigation (audit SEC-6).
@@ -48,26 +52,32 @@ pub async fn navigate(
     // literal-IP subresource/redirect inside the renderer is blocked even
     // if a Rust-side check were ever bypassed (audit 42 High-1).
     // Best-effort; the Rust firewall stays the primary gate.
-    install_blocked_url_patterns(&page).await;
-    let nav_result = tokio::time::timeout(Duration::from_secs(30), async {
-        page.goto(url.as_str()).await
-    })
-    .await;
+    install_blocked_url_patterns(&page, &state.config.blocked_resource_patterns).await;
+    // `wait_until` is honored: "networkidle" (default) keeps the
+    // historical `page.goto()` path; early modes register the CDP
+    // lifecycle listener before `Page.navigate` fires.
+    let mode = NavWaitMode::parse(&req.wait_until);
+    let nav_result = navigate_with_mode(&page, url.as_str(), mode, Duration::from_secs(30)).await;
     match nav_result {
-        Ok(Ok(_)) => {
+        Ok(()) => {
             let (final_url, title) = page_url_title(&page).await;
             finish_navigation(&state, &tab_id, &page, &final_url, &title).await
         }
-        Ok(Err(e)) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"ok": false, "error": format!("navigation failed: {}", e)})),
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::GATEWAY_TIMEOUT,
-            Json(json!({"ok": false, "error": "navigation timeout"})),
-        )
-            .into_response(),
+        Err(e) => {
+            if e.to_string().contains("timeout") {
+                (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(json!({"ok": false, "error": "navigation timeout"})),
+                )
+                    .into_response()
+            } else {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"ok": false, "error": format!("navigation failed: {e}")})),
+                )
+                    .into_response()
+            }
+        }
     }
 }
 
