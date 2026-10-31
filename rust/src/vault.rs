@@ -8,6 +8,7 @@
 //!   checkpoints(origin, path, step, field_key, label, value, updated_at)
 //!   PRIMARY KEY (origin, path, step, field_key)
 
+#![allow(dead_code)] // parked: FormGuard not yet wired to any route (audits HIGH-2, LOW-1)
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -27,6 +28,16 @@ pub const FORMGUARD_JS: &str = r#"
   }
   function capture(el) {
     if (!el || !el.isConnected) return;
+    // Never persist secret-classified controls, even if a selector
+    // matches (audit HIGH-1). Passwords, OTP/PIN fields, and payment
+    // card inputs are skipped entirely — they are never written to the
+    // vault, so a failed login cannot be "replayed" from stored secrets.
+    const t = (el.getAttribute('type') || '').toLowerCase();
+    const ac = (el.getAttribute('autocomplete') || '').toLowerCase();
+    if (t === 'password' ||
+        (t === 'hidden' && el.name && /pass|secret|token|otp|pin/i.test(el.name)) ||
+        ac.includes('password') || ac.startsWith('cc-') ||
+        ac.includes('one-time-code')) return;
     const step = (document.querySelector('h1,h2') || {}).textContent || '';
     const payload = {
       origin: location.origin, path: location.pathname,
@@ -93,7 +104,14 @@ impl Vault {
              ON CONFLICT(origin,path,step,field_key)
              DO UPDATE SET label=excluded.label, value=excluded.value,
                            updated_at=datetime('now')",
-            params![cp.origin, cp.path, cp.step, cp.field_key, cp.label, cp.value],
+            params![
+                cp.origin,
+                cp.path,
+                cp.step,
+                cp.field_key,
+                cp.label,
+                cp.value
+            ],
         )?;
         Ok(())
     }
