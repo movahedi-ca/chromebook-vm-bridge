@@ -28,6 +28,7 @@
 //!    dialogs that stole focus). The coarse full-screen dHash remains only
 //!    as a cheap smoke signal; the gate is what blocks a click.
 
+#![allow(dead_code)] // parked: visual-verification feature not yet wired to any route (audit LOW-1)
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -94,8 +95,7 @@ fn dhash_opt(image_bytes: &[u8]) -> Option<u64> {
     let gray = img.to_luma8();
     // 9x8, nearest: deterministic and cheap. Any resampling filter would do
     // for hashing, but Nearest keeps the transform bit-exact across runs.
-    let small =
-        image::imageops::resize(&gray, 9, 8, image::imageops::FilterType::Nearest);
+    let small = image::imageops::resize(&gray, 9, 8, image::imageops::FilterType::Nearest);
     let mut hash: u64 = 0;
     for y in 0..8u32 {
         for x in 0..8u32 {
