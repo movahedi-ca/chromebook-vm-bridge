@@ -56,7 +56,7 @@ url = "2"
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 
 # MCP server
-rmcp = { version = "0.1", features = ["server"] }
+rmcp = { version = "0.1", features = ["server", "transport-io", "macros"] }
 schemars = "0.8"
 
 # Error handling
