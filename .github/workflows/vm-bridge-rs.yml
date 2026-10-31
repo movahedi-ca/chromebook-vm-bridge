@@ -31,13 +31,18 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy (deny warnings)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Unit tests
-        run: cargo test
+        run: cargo test --locked
+
+      - name: Security audit
+        run: |
+          cargo install --locked cargo-audit
+          cargo audit
 
   # Contract tests need a live Chrome + X11, so they run on the VM, not in
   # CI. (There is no rust/tests/ or scripts/run-contract-tests.sh in this
