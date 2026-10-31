@@ -84,6 +84,7 @@ pub const UPLOAD_STAGE1_JS: &str = r#"() => {
 /// from the bytes in page memory, wraps it in a `DataTransfer`, and dispatches
 /// the full `dragenter` → `dragover` → `drop` sequence onto the container.
 /// Returns `true` when the drop event was dispatched.
+#[allow(dead_code)] // parked: stage-3 upload path not yet wired (audit LOW-1)
 pub const UPLOAD_STAGE3_JS: &str = r#"(container, fileName, mimeType, base64Data) => {
     const bytes = Uint8Array.from(atob(base64Data), (c) => c.charCodeAt(0));
     const file = new File([bytes], fileName, { type: mimeType });
@@ -167,7 +168,10 @@ mod tests {
         let outside = std::env::temp_dir().join("vm-bridge-upload-test-escape-secret.txt");
         fs::write(&outside, b"secret").unwrap();
         // Attempted traversal: <allowlist>/../<outside file>
-        let evil = format!("{}/../vm-bridge-upload-test-escape-secret.txt", dir.display());
+        let evil = format!(
+            "{}/../vm-bridge-upload-test-escape-secret.txt",
+            dir.display()
+        );
         let err = validate_upload_path(&evil, &allowlist(&dir)).unwrap_err();
         assert!(err.to_string().contains("escapes allowlist"));
         fs::remove_dir_all(&dir).ok();
@@ -195,11 +199,8 @@ mod tests {
     #[test]
     fn validate_rejects_missing_file() {
         let dir = std::env::temp_dir().join("vm-bridge-upload-test-missing");
-        let err = validate_upload_path(
-            dir.join("nope.pdf").to_str().unwrap(),
-            &allowlist(&dir),
-        )
-        .unwrap_err();
+        let err = validate_upload_path(dir.join("nope.pdf").to_str().unwrap(), &allowlist(&dir))
+            .unwrap_err();
         assert!(err.to_string().contains("not accessible"));
     }
 }
