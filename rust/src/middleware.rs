@@ -1,8 +1,8 @@
 //! Middleware stack (audit SEC-4, SEC-5).
 //!
-//! Layer order (outermost first): timeout → rate_limit → auth → lease →
-//! body_cap → log → handler. (Registered innermost-first: axum applies the
-//! LAST .layer() call as the outermost wrapper.)
+//! Layer order (outermost first): timeout → `rate_limit` → auth → lease →
+//! `body_cap` → log → handler. (Registered innermost-first: axum applies the
+//! LAST .`layer()` call as the outermost wrapper.)
 //! Rate limiting BEFORE auth so brute-force attempts consume tokens.
 //! The timeout layer bounds total request time (audit HIGH-5).
 //! Body caps count actual bytes streamed (not Content-Length header),
@@ -22,7 +22,7 @@ use futures_util::StreamExt;
 use serde_json::json;
 use std::time::Duration;
 
-/// Pre-auth rate limiting, keyed by (client_identity, raw_path).
+/// Pre-auth rate limiting, keyed by (`client_identity`, `raw_path`).
 ///
 /// NOTE: this middleware runs as a `Router::layer`, i.e. BEFORE route
 /// matching, so `MatchedPath` is never populated here — the key always
@@ -61,14 +61,18 @@ pub async fn rate_limit_middleware(
         "/browser/drag" | "/browser/eval" | "/browser/script"
     ) {
         (
-            governor::Quota::per_minute(std::num::NonZeroU32::new(20).unwrap())
-                .allow_burst(std::num::NonZeroU32::new(5).unwrap()),
+            governor::Quota::per_minute(
+                std::num::NonZeroU32::new(20).expect("20 is a non-zero literal"),
+            )
+            .allow_burst(std::num::NonZeroU32::new(5).expect("5 is a non-zero literal")),
             3u64,
         )
     } else {
         (
-            governor::Quota::per_minute(std::num::NonZeroU32::new(30).unwrap())
-                .allow_burst(std::num::NonZeroU32::new(10).unwrap()),
+            governor::Quota::per_minute(
+                std::num::NonZeroU32::new(30).expect("30 is a non-zero literal"),
+            )
+            .allow_burst(std::num::NonZeroU32::new(10).expect("10 is a non-zero literal")),
             2u64,
         )
     };
@@ -90,7 +94,7 @@ pub async fn rate_limit_middleware(
             .or_insert_with(|| (governor::RateLimiter::direct(quota), now));
         entry.1 = now;
         match entry.0.check() {
-            Ok(_) => None,
+            Ok(()) => None,
             // Worst case the client waits one replenish interval for the
             // next token; never a hardcoded guess.
             Err(_) => Some(replenish_s),
@@ -120,12 +124,23 @@ pub async fn rate_limit_middleware(
 fn client_identity(req: &Request<Body>) -> String {
     req.extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|c| format!("ip:{}", c.0.ip()))
-        .unwrap_or_else(|| "ip:unknown".to_string())
+        .map_or_else(
+            || {
+                // Fail loudly rather than sharing one bucket: a missing
+                // ConnectInfo means the server was built without
+                // into_make_service_with_connect_info (audit 41 LOW-2). The
+                // dedicated "deny:" identity keeps these requests out of every
+                // real client's bucket and alarms on spikes.
+                tracing::warn!("rate-limit: no ConnectInfo on request — using deny bucket");
+                "deny:no-connect-info".to_string()
+            },
+            |c| format!("ip:{}", c.0.ip()),
+        )
 }
 
 /// Body cap: counts ACTUAL bytes streamed through the body, defeating the
 /// chunked-Transfer-Encoding Content-Length bypass (audit SEC-5).
+#[allow(clippy::large_futures)] // 65KB decompress future; axum boxes middleware futures
 pub async fn body_cap_middleware(
     State(state): State<SharedState>,
     req: Request<Body>,
@@ -186,6 +201,7 @@ pub async fn body_cap_middleware(
 
 /// Streaming gzip decompression with a hard output cap (audit SEC-5).
 /// Applied uniformly to ALL endpoints (fixes the eval/script asymmetry).
+#[allow(clippy::large_stack_arrays)] // 64KB streaming chunk buffer; future is boxed by axum so stack depth is bounded
 async fn decompress_capped(input: &[u8], max_out: usize) -> Result<Vec<u8>, String> {
     use async_compression::tokio::bufread::GzipDecoder;
     use tokio::io::AsyncReadExt;
@@ -197,14 +213,13 @@ async fn decompress_capped(input: &[u8], max_out: usize) -> Result<Vec<u8>, Stri
         let n = decoder
             .read(&mut chunk)
             .await
-            .map_err(|e| format!("gzip decode error: {}", e))?;
+            .map_err(|e| format!("gzip decode error: {e}"))?;
         if n == 0 {
             break;
         }
         if out.len() + n > max_out {
             return Err(format!(
-                "decompressed body exceeds cap of {} bytes (zip bomb rejected)",
-                max_out
+                "decompressed body exceeds cap of {max_out} bytes (zip bomb rejected)"
             ));
         }
         out.extend_from_slice(&chunk[..n]);
@@ -214,7 +229,11 @@ async fn decompress_capped(input: &[u8], max_out: usize) -> Result<Vec<u8>, Stri
 
 /// Lease enforcement: when a lease is held, mutating requests to browser #1
 /// need the matching X-Lease-Id header or the bridge answers 423.
-/// Reads never need a lease. Pool paths are exempt (separate browser).
+/// Reads never need a lease. Pool paths are NOT exempt: pool contexts run
+/// on the SAME supervised Chrome as browser #1 (see pool/mod.rs), so the
+/// lease system's exclusivity would be illusory if pool mutations bypassed
+/// it (audit 41 MED-7 — the exemption dated from a "separate browser"
+/// architecture that no longer exists).
 pub async fn lease_middleware(
     State(state): State<SharedState>,
     req: Request<Body>,
@@ -223,23 +242,21 @@ pub async fn lease_middleware(
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let is_mutating = matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
-    let exempt = path == "/lease/acquire"
-        || path == "/lease/release"
-        || path == "/lease/renew"
-        || path.starts_with("/pool/");
+    // Only the lease lifecycle endpoints themselves are exempt.
+    let exempt = path == "/lease/acquire" || path == "/lease/release" || path == "/lease/renew";
 
     if is_mutating && !exempt {
         let allowed = {
             let mut leases = state.leases.lock().await;
-            if !leases.locked() {
-                true
-            } else {
+            if leases.locked() {
                 let presented = req
                     .headers()
                     .get("x-lease-id")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
                 leases.check(presented)
+            } else {
+                true
             }
         };
         if !allowed {
