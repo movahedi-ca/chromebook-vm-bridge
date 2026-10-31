@@ -1,12 +1,12 @@
-//! FormGuard: transactional form checkpoint vault (playbook §11.2).
+//! `FormGuard`: transactional form checkpoint vault (playbook §11.2).
 //!
 //! A tiny JS listener (installed via `Page.addScriptToEvaluateOnNewDocument`)
 //! streams committed field states into this SQLite vault (mode 0600).
 //! After a crash or reload, `/browser/restore_checkpoint` replays them.
 //!
 //! Schema:
-//!   checkpoints(origin, path, step, field_key, label, value, updated_at)
-//!   PRIMARY KEY (origin, path, step, field_key)
+//!   checkpoints(origin, path, step, `field_key`, label, value, `updated_at`)
+//!   PRIMARY KEY (origin, path, step, `field_key`)
 
 #![allow(dead_code)] // parked: FormGuard not yet wired to any route (audits HIGH-2, LOW-1)
 use rusqlite::{params, Connection};
@@ -97,7 +97,7 @@ impl Vault {
     }
 
     pub fn save(&self, cp: &Checkpoint) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().expect("vault sqlite mutex poisoned");
         conn.execute(
             "INSERT INTO checkpoints(origin,path,step,field_key,label,value)
              VALUES (?1,?2,?3,?4,?5,?6)
@@ -117,7 +117,7 @@ impl Vault {
     }
 
     pub fn load(&self, origin: &str, path: &str, step: &str) -> anyhow::Result<Vec<Checkpoint>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().expect("vault sqlite mutex poisoned");
         let mut stmt = conn.prepare(
             "SELECT origin,path,step,field_key,label,value FROM checkpoints
              WHERE origin=?1 AND path=?2 AND step=?3 ORDER BY updated_at",
@@ -132,12 +132,13 @@ impl Vault {
                 value: row.get(5)?,
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.into())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(std::convert::Into::into)
     }
 
     /// Prune checkpoints older than `max_age_days` (default 30).
     pub fn prune(&self, max_age_days: i64) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().expect("vault sqlite mutex poisoned");
         let n = conn.execute(
             "DELETE FROM checkpoints WHERE updated_at < datetime('now', ?1)",
             params![format!("-{} days", max_age_days)],
