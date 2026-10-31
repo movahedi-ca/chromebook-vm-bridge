@@ -30,24 +30,52 @@ use std::time::Duration;
 /// 404-scan path variants is contained by the idle-bucket eviction
 /// below (cap 10k entries, 120s idle TTL).
 ///
-/// Client identity is a hash of the presented `x-api-key` when present
-/// (all production clients arrive through one tailnet tunnel IP, so IP
-/// keying would let one client's burst throttle everyone else), else
-/// the socket IP. Runs before auth, so brute-force attempts consume
-/// tokens too.
+/// Client identity is the socket IP (audit 40 HIGH-3: the presented key is
+/// unverified pre-auth, so it must not feed the identity). Runs before auth,
+/// so brute-force attempts consume tokens too. Liveness probes (/health) are
+/// exempt; expensive paths get the documented stricter quota (audit 40 MED-8).
 pub async fn rate_limit_middleware(
     State(state): State<SharedState>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    let identity = client_identity(&req);
     let path = req.uri().path().to_string();
 
-    // Per-(identity, path) bucket: 30 req/min sustained, burst 10
+    // Liveness probes are never throttled: a monitoring poller must not
+    // 429 itself out of visibility.
+    if path == "/health" {
+        return next.run(req).await;
+    }
+
+    let identity = client_identity(&req);
+
+    // Per-(identity, path) bucket. Expensive paths match the documented
+    // contract (docs/chromebook-vm-setup.md): 1 token per 3s sustained,
+    // burst 5. Everything else: 30 req/min sustained, burst 10
     // (governor's default burst equals the rate; allow_burst pins it
     // to the documented contract).
+    // `replenish_s` is the worst-case wait for the next token, reported
+    // as Retry-After on rejection (audit 40 LOW-9).
+    let (quota, replenish_s) = if matches!(
+        path.as_str(),
+        "/browser/drag" | "/browser/eval" | "/browser/script"
+    ) {
+        (
+            governor::Quota::per_minute(std::num::NonZeroU32::new(20).unwrap())
+                .allow_burst(std::num::NonZeroU32::new(5).unwrap()),
+            3u64,
+        )
+    } else {
+        (
+            governor::Quota::per_minute(std::num::NonZeroU32::new(30).unwrap())
+                .allow_burst(std::num::NonZeroU32::new(10).unwrap()),
+            2u64,
+        )
+    };
     let key = (identity.clone(), path.clone());
-    let allowed = {
+    // On rejection, report the bucket's actual backoff instead of a
+    // hardcoded guess, and set the standard header (audit 40 LOW-9).
+    let retry_after_s: Option<u64> = {
         let mut buckets = state.rate_buckets.lock().await;
         let now = std::time::Instant::now();
         // Bound memory: evict buckets idle longer than 120s once the
@@ -57,25 +85,25 @@ pub async fn rate_limit_middleware(
                 now.duration_since(*last_seen) < Duration::from_secs(120)
             });
         }
-        let entry = buckets.entry(key).or_insert_with(|| {
-            (
-                governor::RateLimiter::direct(
-                    governor::Quota::per_minute(std::num::NonZeroU32::new(30).unwrap())
-                        .allow_burst(std::num::NonZeroU32::new(10).unwrap()),
-                ),
-                now,
-            )
-        });
+        let entry = buckets
+            .entry(key)
+            .or_insert_with(|| (governor::RateLimiter::direct(quota), now));
         entry.1 = now;
-        entry.0.check().is_ok()
+        match entry.0.check() {
+            Ok(_) => None,
+            // Worst case the client waits one replenish interval for the
+            // next token; never a hardcoded guess.
+            Err(_) => Some(replenish_s),
+        }
     };
 
-    if !allowed {
-        tracing::warn!(identity = %identity, path = %path, "rate limit exceeded");
+    if let Some(wait_s) = retry_after_s {
+        tracing::warn!(identity = %identity, path = %path, wait_s, "rate limit exceeded");
         state.metrics.lock().await.rejections_429 += 1;
         return (
             StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({"ok": false, "error": "rate_limited", "retry_after_s": 60})),
+            [("Retry-After", wait_s.to_string())],
+            Json(json!({"ok": false, "error": "rate_limited", "retry_after_s": wait_s})),
         )
             .into_response();
     }
@@ -83,21 +111,13 @@ pub async fn rate_limit_middleware(
     next.run(req).await
 }
 
-/// Stable per-client identity for rate limiting. Prefers a hash of the
-/// presented API key (never the key material itself); falls back to the
-/// socket IP for keyless requests.
+/// Stable per-client identity for rate limiting (audit 40 HIGH-3).
+///
+/// Uses the socket IP only. The presented `x-api-key` is UNVERIFIED at this
+/// layer (auth runs after the rate limiter by design), so keying on it lets
+/// a brute-forcer rotate keys for a fresh bucket on every request and the
+/// pre-auth throttle never fires.
 fn client_identity(req: &Request<Body>) -> String {
-    if let Some(k) = req
-        .headers()
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty())
-    {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        k.hash(&mut h);
-        return format!("key:{:016x}", h.finish());
-    }
     req.extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|c| format!("ip:{}", c.0.ip()))
