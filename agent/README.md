@@ -15,7 +15,6 @@ environment variables. No secrets are stored in these files.
 | `cb-ssh.sh` | Hardened SSH wrapper: multiplexing with stale-master recovery, failure classification into distinct exit codes (proxy-down vs host-down vs auth), retry with capped backoff on transient errors only, pinned host key, per-call audit log. |
 | `cb-job.sh` | Compact job protocol over one SSH call per task: `ping`, `doctor`, `fetch` (URL to text/JSON), `run` (600s cap), `bg`/`status`/`get`/`kill`/`rm` (background jobs with flock-based state), `activity` (on-screen status panel). |
 | `cb-xfer.sh` | `rsync` push/pull between orchestrator and VM with sha256 integrity verification after every transfer. |
-| `bridge-cli.py` | Typed client for the bridge API (`navigate`, `click`, `fill`, `eval`, `tabs`, `lease`, …). Request bodies travel base64'd through `cb-job.sh run` so no shell quoting is ever needed; responses are framed with a `__BRIDGE_DONE__:<curl_exit>:<http_code>` trailer so transport failures can't be mistaken for HTTP errors. |
 
 ## Setup
 
@@ -35,7 +34,6 @@ export GEMINI_BIN="$HOME/bin/gemini_generate.py"  # enables order-smart / move-a
 3. Pin the VM's host key: `CB_PINNED_HOSTS` defaults to
    `~/.ssh/known_hosts.d/chromebook-vm-pinned`. Capture it from the live
    server once; a changed key fails loudly (possible MITM).
-4. The bridge API key is **never** stored here. `bridge-cli.py` has curl read
    it on the VM from `~/.config/vm-bridge/api-key` (mode 600), so the key
    never crosses SSH argv and never appears in logs.
 
@@ -47,5 +45,4 @@ export GEMINI_BIN="$HOME/bin/gemini_generate.py"  # enables order-smart / move-a
   retries transient network errors.
 - Killing the local SSH wrapper does **not** stop the remote process. Use
   `cb-job.sh kill` (process-group kill on the VM) for background jobs.
-- `bridge-cli.py shot` (screenshots) is intentionally binary-safe only via
   file transfer (`cb-xfer.sh pull`), not through the text transport.
