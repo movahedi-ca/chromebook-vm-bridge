@@ -29,7 +29,7 @@ pub struct LeaseIdRequest {
     pub ttl_s: i64,
 }
 
-/// POST /lease/acquire — returns (lease_id, clamped_ttl_s).
+/// POST /lease/acquire — returns (`lease_id`, `clamped_ttl_s`).
 /// 423 if another client holds the lock.
 pub async fn acquire(
     State(state): State<SharedState>,
@@ -103,9 +103,10 @@ pub async fn release(
     }
 }
 
-/// GET /lease/status — lease_id REDACTED (audit SEC-7).
+/// GET /lease/status — `lease_id` REDACTED (audit SEC-7), holder client name
+/// omitted by design (audit 41 MED-8).
 pub async fn status(State(state): State<SharedState>) -> impl IntoResponse {
     let mut leases = state.leases.lock().await;
-    let status = leases.status();
+    let status = leases.status_public();
     Json(json!({"ok": true, "lease": status})).into_response()
 }
