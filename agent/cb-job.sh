@@ -116,8 +116,15 @@ case "$cmd" in
     # Consumer note: fetch.py exit codes are 0 ok, 2 usage, 3 chrome-timeout (retryable), 4 empty-DOM (retryable), 5 chrome-crash, 6 HTTP 4xx/5xx; JSON errors carry {"error","retryable"}.
     # shellcheck disable=SC2029
     $SSH "~/jobs/activity-set.sh working 'fetch' '$url_short'"
-    $SSH "echo $b64 | base64 -d > /tmp/cb-url.txt && python3 ~/jobs/fetch.py \"\$(cat /tmp/cb-url.txt)\" $max; rm -f /tmp/cb-url.txt"
-    $SSH "~/jobs/activity-set.sh idle 'fetched'"
+    # set -e would abort before the idle reset on fetch.py failure
+    # (audit MED-3); capture the rc, always reset the panel, then exit it.
+    # mktemp (audit LOW-4): no shared /tmp/cb-url.txt race under concurrency.
+    set +e
+    $SSH "u=\$(mktemp /tmp/cb-url.XXXXXX); echo $b64 | base64 -d > \"\$u\" && python3 ~/jobs/fetch.py \"\$(cat \"\$u\")\" $max; frc=\$?; rm -f \"\$u\"; exit \$frc"
+    fetch_rc=$?
+    set -e
+    $SSH "~/jobs/activity-set.sh idle 'fetched'" || true
+    exit "$fetch_rc"
     ;;
   run)
     b64=$(printf '%s' "$*" | base64 -w0)
@@ -127,8 +134,13 @@ case "$cmd" in
     # that does all three sequentially: ~0.36s. The panel still updates,
     # just without the round-trip tax.
     # shellcheck disable=SC2029
-    $SSH "~/jobs/activity-set.sh working 'run' '$cmd_short'; echo $b64 | base64 -d | timeout 600 bash > /tmp/cb-run.out 2>&1; rc=\$?; cat /tmp/cb-run.out; rm -f /tmp/cb-run.out; ~/jobs/activity-set.sh idle 'run done' >/dev/null 2>&1 || true; exit \$rc"
-    rc=$?
+    # set -e would abort on a non-zero remote exit before rc=$? runs
+    # (audit MED-3); the if/else form is exempt from set -e.
+    if $SSH "~/jobs/activity-set.sh working 'run' '$cmd_short'; echo $b64 | base64 -d | timeout 600 bash > /tmp/cb-run.out 2>&1; rc=\$?; cat /tmp/cb-run.out; rm -f /tmp/cb-run.out; ~/jobs/activity-set.sh idle 'run done' >/dev/null 2>&1 || true; exit \$rc"; then
+      rc=0
+    else
+      rc=$?
+    fi
     if [ "$rc" -eq 124 ]; then
       # Phase 2A item 9: timeout(1) exit 124 means the 600s cap killed it.
       # Say so explicitly instead of silently truncating. (A remote command
