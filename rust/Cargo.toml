@@ -2,6 +2,7 @@
 name = "vm-bridge"
 version = "2.0.0"
 edition = "2021"
+rust-version = "1.87"
 description = "Rust rewrite of chromebook-vm-bridge: FastAPI+Playwright browser bridge as a single static binary"
 license = "MIT"
 
@@ -13,7 +14,6 @@ path = "src/main.rs"
 # HTTP server + async runtime
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
-tower = { version = "0.4", features = ["full"] }
 tower-http = { version = "0.5", features = ["limit", "compression-gzip", "trace", "timeout"] }
 
 # Browser automation via CDP (replaces Playwright)
@@ -28,7 +28,6 @@ serde_json = "1"
 
 # Image hashing / comparison (replaces PIL+numpy+scikit-image)
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-img_hash = "3"
 
 # SQLite for FormGuard vault
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -68,7 +67,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 indexmap = { version = "2", features = ["serde"] }
 dirs = "5"
-validator = { version = "0.18", features = ["derive"] }
 futures-util = "0.3"
 regex = "1"
 
@@ -88,4 +86,10 @@ strip = true
 # of killing the entire CDP connection. Without this, any real network
 # activity eventually poisons the connection and the bridge goes deaf.
 [patch.crates-io]
+# chromiumoxide 0.7.0 vendored (audit 40 LOW-11): upstream WS layer treats any
+# unparseable CDP message as fatal; Chrome 156 protocol drift killed the
+# connection on every page load. Local change is conn.rs only — see
+# rust/vendor/CHROMIUMOXIDE_PATCH.md and rust/vendor/chromiumoxide-conn.patch.
+# Re-evaluate on every upstream release; upstream security fixes do not arrive
+# automatically while vendored.
 chromiumoxide = { path = "vendor/chromiumoxide" }
