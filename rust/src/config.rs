@@ -14,10 +14,10 @@ pub struct Config {
     pub bind_addr: String,
     /// Bind port (default 8899; Rust dev instance uses 8900)
     pub bind_port: u16,
-    /// Unix domain socket path (optional second listener)
-    pub unix_socket: Option<PathBuf>,
 
     /// Scoped API keys. Server refuses to start if any required key is unset.
+    /// Falls back to BRIDGE_API_KEY when unset (see Config::load).
+    #[serde(default)]
     pub keys: ApiKeys,
 
     /// X11 display for the headed browser (default :1)
@@ -38,26 +38,33 @@ pub struct Config {
     /// Artifact retention
     pub failure_dir: PathBuf,
     pub trace_dir: PathBuf,
+    #[allow(dead_code)] // retention enforcement not built yet
     pub max_artifacts: usize,
+    #[allow(dead_code)] // retention enforcement not built yet
     pub artifact_ttl_hours: u64,
 
     /// Upload staging allowlist
     pub upload_dirs: Vec<PathBuf>,
 
     /// FormGuard vault path
+    #[allow(dead_code)] // vault is parked (audit HIGH-2)
     pub vault_path: PathBuf,
 
     /// Playbook dir
+    #[allow(dead_code)] // playbook engine not built yet
     pub playbook_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ApiKeys {
     /// Read-only: GET endpoints
+    #[serde(default)]
     pub read: String,
     /// Interactions: clicks, fills, navigation
+    #[serde(default)]
     pub act: String,
     /// Admin: /browser/eval, /pool/eval, /ops/*
+    #[serde(default)]
     pub admin: String,
 }
 
@@ -85,12 +92,36 @@ impl Config {
         // Resolve paths (no hardcoded /home/auto)
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         builder = builder
-            .set_default("profile_dir", home.join(".config/chrome-automation").to_string_lossy().to_string())?
-            .set_default("failure_dir", home.join("jobs/vm-bridge/failures").to_string_lossy().to_string())?
-            .set_default("trace_dir", home.join("jobs/vm-bridge/traces").to_string_lossy().to_string())?
-            .set_default("vault_path", cfg_dir.join("form_vault.db").to_string_lossy().to_string())?
-            .set_default("playbook_dir", cfg_dir.join("playbooks").to_string_lossy().to_string())?
-            .set_default("upload_dirs", vec![home.join("jobs/uploads").to_string_lossy().to_string()])?;
+            .set_default(
+                "profile_dir",
+                home.join(".config/chrome-automation")
+                    .to_string_lossy()
+                    .to_string(),
+            )?
+            .set_default(
+                "failure_dir",
+                home.join("jobs/vm-bridge/failures")
+                    .to_string_lossy()
+                    .to_string(),
+            )?
+            .set_default(
+                "trace_dir",
+                home.join("jobs/vm-bridge/traces")
+                    .to_string_lossy()
+                    .to_string(),
+            )?
+            .set_default(
+                "vault_path",
+                cfg_dir.join("form_vault.db").to_string_lossy().to_string(),
+            )?
+            .set_default(
+                "playbook_dir",
+                cfg_dir.join("playbooks").to_string_lossy().to_string(),
+            )?
+            .set_default(
+                "upload_dirs",
+                vec![home.join("jobs/uploads").to_string_lossy().to_string()],
+            )?;
 
         // Optional TOML file
         let toml_path = cfg_dir.join("config.toml");
@@ -105,7 +136,34 @@ impl Config {
                 .try_parsing(true),
         );
 
-        let cfg: Config = builder.build()?.try_deserialize()?;
+        let mut cfg: Config = builder.build()?.try_deserialize()?;
+
+        // Single-key fallback: if the scoped keys are unset, accept the
+        // legacy BRIDGE_API_KEY value for all three scopes. This makes the
+        // Rust bridge a drop-in replacement for existing clients that send
+        // one X-API-Key for everything — no client changes needed.
+        // (Operators who want real scope separation set the three
+        // VM_BRIDGE_KEYS__* values instead; those take precedence.)
+        if cfg.keys.read.trim().is_empty()
+            || cfg.keys.act.trim().is_empty()
+            || cfg.keys.admin.trim().is_empty()
+        {
+            if let Ok(legacy) = std::env::var("BRIDGE_API_KEY") {
+                let legacy = legacy.trim().to_string();
+                if !legacy.is_empty() {
+                    if cfg.keys.read.trim().is_empty() {
+                        cfg.keys.read = legacy.clone();
+                    }
+                    if cfg.keys.act.trim().is_empty() {
+                        cfg.keys.act = legacy.clone();
+                    }
+                    if cfg.keys.admin.trim().is_empty() {
+                        cfg.keys.admin = legacy.clone();
+                    }
+                    tracing::info!("using BRIDGE_API_KEY as fallback for unset scoped keys");
+                }
+            }
+        }
 
         // Fail fast on missing keys (audit SEC-4)
         for (name, key) in [
