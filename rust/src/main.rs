@@ -6,14 +6,12 @@
 mod auth;
 mod browser;
 mod config;
-mod hud;
 mod input;
 mod interact;
 mod leases;
 mod mcp;
 mod middleware;
 mod perception;
-mod playbooks;
 mod pool;
 mod privy;
 mod routes;
@@ -24,7 +22,6 @@ mod watchdog;
 use crate::config::Config;
 use crate::state::{BridgeState, SharedState};
 use axum::{
-    extract::State,
     http::StatusCode,
     middleware as axum_mw,
     response::{IntoResponse, Json},
@@ -136,12 +133,18 @@ async fn main() -> anyhow::Result<()> {
         .route("/browser/eval", post(routes::input::eval))
         .route("/browser/script", post(routes::advanced::script))
         .route("/browser/order", post(routes::advanced::order))
-        .route("/browser/autocomplete", post(routes::advanced::autocomplete))
+        .route(
+            "/browser/autocomplete",
+            post(routes::advanced::autocomplete),
+        )
         .route(
             "/browser/geometry/refresh",
             post(routes::read::geometry_refresh),
         )
-        .route("/browser/assert_visual", post(routes::advanced::assert_visual))
+        .route(
+            "/browser/assert_visual",
+            post(routes::advanced::assert_visual),
+        )
         .route(
             "/browser/screenshot/compare",
             post(routes::advanced::screenshot_compare),
@@ -190,7 +193,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/lease/status", get(routes::lease::status))
         // Ops routes
         .route("/ops/render_package", post(routes::ops::render_package))
-        // Layers: outermost first
+        // Honest JSON 404 for unmatched routes (audit MED-6)
+        .fallback(fallback_404)
+        // Layers: registered innermost-first (axum applies the LAST
+        // .layer() call as the outermost wrapper).
         .layer(axum_mw::from_fn_with_state(
             state.clone(),
             middleware::log_middleware,
@@ -211,14 +217,29 @@ async fn main() -> anyhow::Result<()> {
             state.clone(),
             middleware::rate_limit_middleware,
         ))
+        // Outermost (registered last): hard bound on total request time
+        // (audit HIGH-5). No request — handler, middleware, or supervisor
+        // wait — may run longer than this; timeouts surface as HTTP 408.
+        .layer(tower_http::timeout::TimeoutLayer::new(Duration::from_secs(
+            120,
+        )))
         .with_state(state.clone());
 
-    // Graceful shutdown (audit BUG-4: no orphan Chrome on exit)
+    // Graceful shutdown (audit BUG-4: no orphan Chrome on exit).
+    // systemd sends SIGTERM on stop/restart — handle it alongside
+    // Ctrl-C (audit MED-1), otherwise the 20s drain below is skipped.
     let shutdown_state = state.clone();
     let graceful = async move {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install ctrl-c handler");
+        #[cfg(unix)]
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
+        #[cfg(unix)]
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = sigterm.recv() => {},
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
         tracing::info!("shutdown signal received");
         shutdown_state
             .shutting_down
