@@ -33,6 +33,7 @@
 //! the DOM changed between the two calls. Never re-collect inside the
 //! inject step.
 
+#![allow(dead_code)] // parked: SoM overlay not yet wired to any route (audit LOW-1)
 /// Injects the Set-of-Marks overlay for one AX snapshot node list.
 ///
 /// A JS arrow-function expression string; invoke as
