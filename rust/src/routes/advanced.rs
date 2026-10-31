@@ -347,7 +347,101 @@ const ORDER_RESOLVE_JS: &str = r#"(text, role, isFill) => {
     return null;
 }"#;
 
-/// Poll the resolver until it finds a target or the timeout expires.
+/// Shell for the MutationObserver-driven order resolver. `__ORDER_FIND__` is
+/// spliced with [`ORDER_RESOLVE_JS`] at runtime, so the finder's four passes
+/// stay byte-identical and the existing unit test keeps covering them.
+///
+/// Takes `(text, role, isFill, timeoutMs)`; returns a Promise resolving to
+/// `{x, y}` or `null`. The observer re-runs the finder when the DOM
+/// mutates, debounced so scans never happen more often than the old 150ms
+/// poll cadence (a continuously-mutating page costs no more scans than
+/// before); the in-page timer enforces the timeout.
+const ORDER_PROMISE_SHELL: &str = r"((text, role, isFill, timeoutMs) => new Promise((resolve) => {
+    const find = __ORDER_FIND__;
+    let done = false;
+    let obs = null;
+    let deferTimer = null;
+    let limitTimer = null;
+    const finish = (v) => {
+        if (done) return;
+        done = true;
+        try { if (obs) obs.disconnect(); } catch (e) {}
+        if (deferTimer !== null) { clearTimeout(deferTimer); deferTimer = null; }
+        if (limitTimer !== null) { clearTimeout(limitTimer); limitTimer = null; }
+        resolve(v);
+    };
+    const h0 = find(text, role, isFill);
+    if (h0) { finish(h0); return; }
+    let lastScan = Date.now();
+    limitTimer = setTimeout(() => finish(null), timeoutMs);
+    obs = new MutationObserver(() => {
+        if (done) return;
+        const now = Date.now();
+        const wait = 150 - (now - lastScan);
+        if (wait <= 0) {
+            lastScan = now;
+            const h = find(text, role, isFill);
+            if (h) finish(h);
+        } else if (deferTimer === null) {
+            deferTimer = setTimeout(() => {
+                deferTimer = null;
+                if (done) return;
+                lastScan = Date.now();
+                const h2 = find(text, role, isFill);
+                if (h2) finish(h2);
+            }, wait);
+        }
+    });
+    try {
+        obs.observe(document.documentElement || document,
+            { childList: true, subtree: true, attributes: true, characterData: true });
+    } catch (e) { /* observe failed: limitTimer still enforces the timeout */ }
+}))";
+
+/// The promise shell with the 4-pass finder spliced in. Built at runtime so
+/// the finder text has a single source of truth.
+fn order_resolve_promise_js() -> String {
+    ORDER_PROMISE_SHELL.replacen("__ORDER_FIND__", ORDER_RESOLVE_JS, 1)
+}
+
+/// Evaluate the order-resolver promise, awaiting it via CDP `awaitPromise`.
+///
+/// The JS resolves with `{x, y}` when the target appears, or `null` when its
+/// internal timer (the remaining order budget) expires. The Rust-side timeout
+/// is a backstop only, for a hung CDP call.
+async fn eval_order_promise(
+    page: &Page,
+    js: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<serde_json::Value> {
+    use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
+    let params = EvaluateParams::builder()
+        .expression(js)
+        .await_promise(true)
+        .build()
+        .map_err(|e| anyhow::anyhow!("order eval params: {e}"))?;
+    let result = tokio::time::timeout(
+        Duration::from_millis(timeout_ms.saturating_add(5_000)),
+        page.evaluate(params),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("order resolve timed out"))??;
+    let v: serde_json::Value = result
+        .into_value()
+        .map_err(|e| anyhow::anyhow!("deserialize order result: {e}"))?;
+    Ok(v)
+}
+
+/// Resolve the order target, waiting efficiently for it to appear.
+///
+/// The 4-pass matcher is unchanged; instead of re-running the full DOM scan
+/// every 150ms from Rust, a single CDP evaluation awaits a promise that a
+/// `MutationObserver` resolves the moment a match appears. The in-page timer
+/// enforces the clamped timeout, so the miss path still returns `None`
+/// exactly at the deadline and the hit path returns the same `(x, y)`.
+/// A transient CDP failure (e.g. a navigation destroying the execution
+/// context mid-wait) retries with a fresh observer until the deadline,
+/// exactly like the old poll loop did.
 async fn resolve_order_center(
     page: &Page,
     text: &str,
@@ -355,29 +449,39 @@ async fn resolve_order_center(
     is_fill: bool,
     timeout_ms: u64,
 ) -> Option<(f64, f64)> {
-    let js = format!(
-        "({})({},{},{})",
-        ORDER_RESOLVE_JS,
-        serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string()),
-        serde_json::to_string(role).unwrap_or_else(|_| "\"\"".to_string()),
-        if is_fill { "true" } else { "false" },
-    );
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(clamp_timeout(timeout_ms));
+    let timeout = clamp_timeout(timeout_ms);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout);
+    let shell = order_resolve_promise_js();
+    let text_js = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
+    let role_js = serde_json::to_string(role).unwrap_or_else(|_| "\"\"".to_string());
+    let fill_js = if is_fill { "true" } else { "false" };
     loop {
-        if let Ok(v) = eval_json(page, &js).await {
-            if !v.is_null() {
-                if let (Some(x), Some(y)) = (
-                    v.get("x").and_then(serde_json::Value::as_f64),
-                    v.get("y").and_then(serde_json::Value::as_f64),
-                ) {
-                    return Some((x, y));
-                }
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
+        let remaining_ms = u64::try_from(
+            deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        if remaining_ms == 0 {
             return None;
         }
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Rebuild per attempt with the remaining budget so a retry after a
+        // transient failure can never overrun the original deadline.
+        let js = format!("({shell})({text_js},{role_js},{fill_js},{remaining_ms})");
+        // A transient CDP failure (navigation tore down the context, target
+        // crashed, ...) falls through and retries until the deadline.
+        if let Ok(v) = eval_order_promise(page, &js, remaining_ms).await {
+            if v.is_null() {
+                return None;
+            }
+            if let (Some(x), Some(y)) = (
+                v.get("x").and_then(serde_json::Value::as_f64),
+                v.get("y").and_then(serde_json::Value::as_f64),
+            ) {
+                return Some((x, y));
+            }
+            // Non-null but malformed: keep waiting until the deadline.
+        }
     }
 }
 
@@ -1373,6 +1477,30 @@ mod tests {
             "querySelectorAll('label')",
         ] {
             assert!(ORDER_RESOLVE_JS.contains(token), "missing {token}");
+        }
+    }
+
+    #[test]
+    fn order_promise_shell_splices_finder() {
+        let js = order_resolve_promise_js();
+        assert!(!js.contains("__ORDER_FIND__"), "placeholder not spliced");
+        // The finder's four passes must be present verbatim.
+        for token in [
+            "CSS.escape",
+            "aria-label",
+            "getAttribute('title')",
+            "getBoundingClientRect",
+        ] {
+            assert!(js.contains(token), "missing {token}");
+        }
+        // The efficient-wait machinery must be present.
+        for token in [
+            "MutationObserver",
+            "new Promise",
+            "setTimeout",
+            "disconnect",
+        ] {
+            assert!(js.contains(token), "missing {token}");
         }
     }
 }
