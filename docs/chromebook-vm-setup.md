@@ -39,7 +39,7 @@ No secrets live in this repo: the API key is deployed out-of-band (see
 
 | Unit | Purpose |
 |---|---|
-| `vm-bridge.service` | The Python bridge: `uvicorn` on `localhost:8899`. `Type=notify` with `WatchdogSec=30`, `Restart=on-failure`, `MemoryMax=3G`, `DISPLAY=:1`. API key via `EnvironmentFile`. |
+| `vm-bridge-rs.service` | The bridge: Rust binary on `localhost:8899`. `Type=notify` with `WatchdogSec=60`, `Restart=on-failure`, `MemoryMax=4G`, `DISPLAY=:1`. API key via `EnvironmentFile`. |
 | `main-chrome.service` | Keeps the headed Chrome alive on `:1`. |
 | `vnc.service`, `novnc.service`, `novnc-kiosk.service` | Remote desktop viewing. |
 | `mirror-feed.service`, `mirror-display.service` | Physical-screen mirror of `:1`. |
@@ -47,11 +47,9 @@ No secrets live in this repo: the API key is deployed out-of-band (see
 
 ## `~/jobs` layout
 
-- `vm-bridge/` — live Python bridge: `app.py`, `human_mouse.py`, `venv/`,
-  `.bridge-version` marker, `failures/` (bounded failure screenshots).
-- `vm-bridge-rs/` — Rust rewrite build tree (see `rust/` in this repo).
-  Built and tested; the systemd cutover has not happened yet, so the Python
-  bridge on `:8899` remains the live server.
+- `vm-bridge-rs/` — Rust bridge build tree (see `rust/` in this repo).
+  The live server on `:8899` via the `vm-bridge-rs` systemd unit.
+- `vm-bridge/` — retained as a rollback target (not live).
 - `fetch.py` — static page fetcher (curl with Chrome TLS impersonation),
   fenced with responsible-use rules: denylist, robots.txt honored,
   per-host rate limiting, audit log.
@@ -93,12 +91,9 @@ screenshots) are transferred as files, never parsed as text.
    `/browser/script`) are token-bucket limited (1 token per 3s, burst 5).
    "Max speed" automation is throttled by this, not by the client.
 
-## Rust rewrite
+## The bridge
 
-`rust/` in this repo is the in-progress Rust rewrite (axum + tokio +
+`rust/` in this repo is the bridge (axum + tokio +
 chromiumoxide): scoped API keys, SSRF firewall, FormGuard vault, perception
 plane (AX snapshot / Set-of-Marks / DOM diffing), playbook engine, and an MCP
 server (`--mcp-stdio`, 10 tools). CI builds and tests it on every push.
-Cutover plan: the Rust binary runs beside the Python bridge until the
-remaining handlers reach parity, then the Python tree moves to
-`python-legacy/`.
