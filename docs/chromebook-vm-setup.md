@@ -77,14 +77,21 @@ No secrets live in this repo: the API key is deployed out-of-band (see
   committed, never pasted into chat, and never transported off the box.
 - Deploy scripts must never overwrite the env file.
 
-## Agent-side tooling (not in this repo)
+## Agent-side tooling (`agent/`)
 
-The orchestrator side keeps its own private tooling: an SSH wrapper over the
-tailnet, a job runner (`ping`/`ls`/`fetch`/`run`/`bg`/`status`/`get`/`kill`),
+The orchestrator side keeps its tooling in this repo under `agent/` (audit
+41 LOW-4: this section used to say it was not in the repo): an SSH wrapper
+over the tailnet, a job runner (`ping`/`ls`/`fetch`/`run`/`bg`/`status`/`get`/`kill`),
 a file-transfer helper, and a CLI whose responses end with a
 `__BRIDGE_DONE__:<curl_exit>:<http_code>` trailer so transient curl failures
 (exits 7/28/52) can be retried once with backoff. Binary responses (e.g.
-screenshots) are transferred as files, never parsed as text.
+screenshots) are transferred as files, never parsed as text. See
+`agent/README.md` for usage.
+
+Parked features (designed, not yet wired — see the code comments, not the
+marketing): FormGuard vault, Set-of-Marks overlay, DOM diffing, and the
+playbook engine are compiled but unreachable behind `#[allow(dead_code)]`.
+Do not plan workflows against them.
 
 ## Operational rules (standing)
 
