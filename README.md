@@ -15,13 +15,13 @@ an SSH tunnel or the tailnet proxy.
 - REST endpoints for navigation, clicking, typing, screenshots, DOM snapshots,
   tab management, and an order-smart element resolver (deterministic
   nodeId-first, with optional LLM escalation via accessibility snapshot).
-- Context pool (max 3, LRU) for parallel background work, with
-  resource blocking and failure screenshots.
+- Context pool (max 3, LRU) for parallel background work.
+  (Resource blocking and failure screenshots are planned, not yet implemented.)
 - Human-like mouse movement with eased trajectories, for
   interactions that need to look natural.
 - Hardening: X-API-Key auth (scoped keys: read/act/admin), per-path token-bucket
   rate limiting, JSON request logging, body-size caps, lease manager for
-  exclusive sessions, SSIM visual-assertion endpoint, crash watchdog with
+  exclusive sessions, pixel-diff visual-assertion endpoint, crash watchdog with
   auto-relaunch, SSRF firewall.
 - MCP server (`--mcp-stdio`) with 10 tools for agent integration.
 - Perception plane: AX snapshot with stable `[ref]` handles, screenshot
@@ -79,3 +79,10 @@ Every request carries `X-API-Key: <key>`, except `/health`.
   browser's sessions. Treat the key like a password.
 - Scoped keys (`VM_BRIDGE_KEYS__READ/ACT/ADMIN`) provide least-privilege
   access; `BRIDGE_API_KEY` grants full scope for drop-in compatibility.
+- SSRF firewall: navigation URLs are validated (http/https only; loopback,
+  link-local, private, CGNAT, and IPv6 unique-local ranges blocked).
+  Residual risk (audit 40 MED-2): DNS-rebinding TOCTOU — the bridge resolves
+  the host, then Chrome resolves it again at navigate time, so a hostile DNS
+  zone could serve a benign IP to the check and a private IP to Chrome.
+  Accepted for a single-operator bridge; do not point the bridge at
+  untrusted DNS.
