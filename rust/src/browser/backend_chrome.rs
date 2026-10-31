@@ -70,7 +70,11 @@ impl ChromeBackend {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        anyhow::bail!("chrome debug port {} did not answer within {}s", port, PORT_WAIT_SECS)
+        anyhow::bail!(
+            "chrome debug port {} did not answer within {}s",
+            port,
+            PORT_WAIT_SECS
+        )
     }
 
     /// Reap a dead child (or take back a live one). Returns true when the
@@ -112,22 +116,54 @@ impl ChromeBackend {
     }
 
     /// Best-effort removal of a stray browser holding our debug port (e.g.
-    /// orphaned by a bridge crash). Scoped to our exact remote-debugging
-    /// port flag so nothing else is touched.
+    /// orphaned by a bridge crash). PID-based (audit MED-4): scans /proc
+    /// for processes whose exe is a chrome binary AND whose cmdline carries
+    /// our exact --remote-debugging-port flag, instead of `pkill -f` on a
+    /// regex that could match an unrelated process.
     async fn clear_stray_listener(&self, port: u16) {
-        let pattern = format!("chrome.*--remote-debugging-port={}", port);
-        let status = tokio::process::Command::new("pkill")
-            .arg("-f")
-            .arg(&pattern)
-            .status()
-            .await;
-        match status {
-            Ok(st) if st.success() => {
-                tracing::warn!(port, "killed stray browser holding the debug port");
+        let flag = format!("--remote-debugging-port={}", port);
+        let mut killed = 0;
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            for entry in entries.flatten() {
+                let pid: i32 = match entry.file_name().to_string_lossy().parse() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                let exe_ok = std::fs::read_link(format!("/proc/{}/exe", pid))
+                    .map(|p| {
+                        p.file_name()
+                            .map(|n| {
+                                let n = n.to_string_lossy();
+                                n.contains("chrome") || n.contains("chromium")
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if !exe_ok {
+                    continue;
+                }
+                let cmdline = std::fs::read(format!("/proc/{}/cmdline", pid))
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default();
+                if cmdline.split('\0').any(|a| a == flag) {
+                    // SIGTERM first (lets Chrome clean its profile); the
+                    // supervisor's next spawn reaps anything left.
+                    let _ = std::process::Command::new("kill")
+                        .arg("-TERM")
+                        .arg(pid.to_string())
+                        .status();
+                    killed += 1;
+                }
             }
-            _ => {
-                tracing::info!(port, "no stray browser on the debug port (or pkill unavailable)");
-            }
+        }
+        if killed > 0 {
+            tracing::warn!(
+                port,
+                killed,
+                "sent SIGTERM to stray chrome holding the debug port"
+            );
+        } else {
+            tracing::info!(port, "no stray browser on the debug port");
         }
         // Give the port a moment to go quiet.
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -174,9 +210,40 @@ impl BrowserBackend for ChromeBackend {
     fn kill<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             if let Some(mut child) = self.child.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-                tracing::info!("chrome child killed");
+                // Graceful TERM first (audit MED-4): a SIGKILL'd Chrome never
+                // cleans its profile, so the next launch lands on the
+                // "didn't shut down correctly" restore dialog and blocks
+                // automation. Escalate to KILL only after a 5s grace period.
+                #[cfg(unix)]
+                {
+                    use std::process::Command as ProcCommand;
+                    let pid = child.id();
+                    let _ = ProcCommand::new("kill")
+                        .arg("-TERM")
+                        .arg(pid.to_string())
+                        .status();
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) if std::time::Instant::now() < deadline => {
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                            _ => {
+                                let _ = child.kill(); // escalate: SIGKILL
+                                let _ = child.wait();
+                                break;
+                            }
+                        }
+                    }
+                    tracing::info!("chrome child terminated");
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    tracing::info!("chrome child killed");
+                }
             }
         })
     }
