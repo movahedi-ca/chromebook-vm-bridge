@@ -4,7 +4,7 @@
 //! logic as the HTTP routes. Serve via `serve_stdio()`.
 
 use crate::state::SharedState;
-use rmcp::{tool, ServerHandler, ServiceExt, model::ServerInfo};
+use rmcp::{model::ServerInfo, tool, ServerHandler, ServiceExt};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -29,6 +29,7 @@ pub struct FillRefParams {
     #[schemars(description = "[ref=N] handle from the AX snapshot")]
     pub r#ref: u32,
     #[schemars(description = "Text to fill into the field")]
+    #[allow(dead_code)] // parsed but unused while fill_ref is a guidance stub (audit MED-7)
     pub text: String,
 }
 
@@ -75,7 +76,7 @@ impl BridgeMcp {
 
     #[tool(description = "Navigate the browser to a URL (SSRF-filtered)")]
     async fn navigate(&self, #[tool(aggr)] params: NavigateParams) -> String {
-        match crate::privy::validate_navigate_url(&params.url, &[]) {
+        match crate::privy::validate_navigate_url(&params.url, &[]).await {
             Ok(u) => json!({"ok": true, "url": u.as_str(), "validated": true}).to_string(),
             Err(e) => json!({"ok": false, "error": e}).to_string(),
         }
@@ -95,12 +96,14 @@ impl BridgeMcp {
 
     #[tool(description = "Click an element by [ref=N] handle (verified)")]
     async fn click_ref(&self, #[tool(aggr)] params: ClickRefParams) -> String {
-        json!({"ok": false, "error": "click via HTTP /browser/click for now", "ref": params.r#ref}).to_string()
+        json!({"ok": false, "error": "click via HTTP /browser/click for now", "ref": params.r#ref})
+            .to_string()
     }
 
     #[tool(description = "Fill a field by [ref=N] (React-aware)")]
     async fn fill_ref(&self, #[tool(aggr)] params: FillRefParams) -> String {
-        json!({"ok": false, "error": "fill via HTTP /browser/fill for now", "ref": params.r#ref}).to_string()
+        json!({"ok": false, "error": "fill via HTTP /browser/fill for now", "ref": params.r#ref})
+            .to_string()
     }
 
     #[tool(description = "Resolve natural-language instruction to element refs")]
@@ -113,14 +116,17 @@ impl BridgeMcp {
         // Validate path via interact::upload::validate_upload_path
         let allowlist = self.state.config.upload_dirs.clone();
         match crate::interact::upload::validate_upload_path(&params.path, &allowlist) {
-            Ok(p) => json!({"ok": true, "path": p.to_string_lossy(), "ref": params.r#ref}).to_string(),
+            Ok(p) => {
+                json!({"ok": true, "path": p.to_string_lossy(), "ref": params.r#ref}).to_string()
+            }
             Err(e) => json!({"ok": false, "error": e.to_string()}).to_string(),
         }
     }
 
     #[tool(description = "Capture screenshot with Set-of-Marks overlay")]
     async fn screenshot_marks(&self) -> String {
-        json!({"ok": false, "error": "screenshot via HTTP /browser/som_screenshot for now"}).to_string()
+        json!({"ok": false, "error": "screenshot via HTTP /browser/som_screenshot for now"})
+            .to_string()
     }
 
     #[tool(description = "Get current browser tabs")]
@@ -154,9 +160,15 @@ impl ServerHandler for BridgeMcp {
 pub async fn serve_stdio(state: SharedState) -> anyhow::Result<()> {
     let service = BridgeMcp::new(state);
     let transport = (tokio::io::stdin(), tokio::io::stdout());
-    let server = service.serve(transport).await.map_err(|e| anyhow::anyhow!("mcp serve: {}", e))?;
+    let server = service
+        .serve(transport)
+        .await
+        .map_err(|e| anyhow::anyhow!("mcp serve: {}", e))?;
     tracing::info!("MCP server running on stdio");
-    let quit = server.waiting().await.map_err(|e| anyhow::anyhow!("mcp waiting: {}", e))?;
+    let quit = server
+        .waiting()
+        .await
+        .map_err(|e| anyhow::anyhow!("mcp waiting: {}", e))?;
     tracing::info!(?quit, "MCP server stopped");
     Ok(())
 }
