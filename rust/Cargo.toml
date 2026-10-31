@@ -14,7 +14,7 @@ path = "src/main.rs"
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 tower = { version = "0.4", features = ["full"] }
-tower-http = { version = "0.5", features = ["limit", "compression-gzip", "trace"] }
+tower-http = { version = "0.5", features = ["limit", "compression-gzip", "trace", "timeout"] }
 
 # Browser automation via CDP (replaces Playwright)
 chromiumoxide = { version = "0.7", features = ["tokio-runtime"] }
