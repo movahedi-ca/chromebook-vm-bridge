@@ -10,6 +10,7 @@
 use crate::browser::Browser1;
 use crate::config::Config;
 use crate::leases::LeaseTable;
+use crate::perception::AxMapper;
 use crate::pool::PoolState;
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -148,6 +149,8 @@ pub struct BridgeState {
     pub leases: Mutex<LeaseTable>,
     pub metrics: Mutex<Metrics>,
     pub rate_buckets: Mutex<RateBuckets>,
+    /// Per-tab [ref=N] -> backendDOMNodeId mappers (perception plane)
+    pub ax_mappers: Mutex<HashMap<String, AxMapper>>,
     /// X11 connection: std Mutex, NEVER held across .await (it's blocking X11 I/O)
     pub x11: StdMutex<Option<x11rb::rust_connection::RustConnection>>,
     /// Shutdown flag for graceful teardown (audit BUG-4)
@@ -165,6 +168,7 @@ impl BridgeState {
             leases: Mutex::new(LeaseTable::new()),
             metrics: Mutex::new(Metrics::default()),
             rate_buckets: Mutex::new(HashMap::new()),
+            ax_mappers: Mutex::new(HashMap::new()),
             x11: StdMutex::new(None),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             internal_token: Uuid::new_v4().to_string(),
