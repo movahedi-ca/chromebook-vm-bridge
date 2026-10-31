@@ -1,4 +1,7 @@
 #!/bin/bash
+# shellcheck disable=SC2088 # `~/jobs/...` inside $SSH "..." strings is
+# expanded by the REMOTE shell by design (remote user auto); the local
+# shell must NOT expand it. Same rationale as the SC2029 disables below.
 # cb-job.sh - compact job protocol for chromebook-vm.
 # One SSH call per task. Results come back as compact text/JSON, never a
 # running narration. Token discipline: batch the work, cap the output.
@@ -194,7 +197,8 @@ case "$cmd" in
     ;;
   rm)
     name="$1"; _name_ok "$name" || exit 2
-    $SSH "rm -f ~/jobs/out/$name.pid ~/jobs/out/$name.pgid ~/jobs/out/$name.log ~/jobs/out/$name.exit ~/jobs/out/$name.cmd ~/jobs/out/$name.lock && echo removed:$name"
+    # NOTE: no $name.pid — only .pgid is ever written (audit 41 LOW-14).
+    $SSH "rm -f ~/jobs/out/$name.pgid ~/jobs/out/$name.log ~/jobs/out/$name.exit ~/jobs/out/$name.cmd ~/jobs/out/$name.lock && echo removed:$name"
     ;;
   activity)
     # Show a working message on the VNC display panel (for visual sessions),
