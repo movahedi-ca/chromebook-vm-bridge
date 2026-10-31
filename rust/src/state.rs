@@ -1,7 +1,7 @@
 //! Central shared state for vm-bridge.
 //!
 //! Every mutable structure lives behind a `tokio::sync` lock. The borrow
-//! checker plus these locks make the Python audit's "non-atomic
+//! checker plus these locks make the the legacy audit's "non-atomic
 //! read-modify-write across await boundaries" (BUG-2) a compile error.
 //!
 //! Lock ordering (to avoid deadlock): browser1 -> tabs -> leases -> metrics.
@@ -30,7 +30,7 @@ pub struct TabEntry {
 }
 
 /// LRU tab registry. `IndexMap` preserves insertion order; `move_to_end`
-/// on access gives true LRU (fixes Python's FIFO `next(iter(_tabs))` bug).
+/// on access gives true LRU (fixes the legacy FIFO `next(iter(_tabs))` bug).
 pub struct TabRegistry {
     tabs: IndexMap<String, TabEntry>,
     active_id: Option<String>,
@@ -71,9 +71,7 @@ impl TabRegistry {
     }
 
     pub fn switch(&mut self, id: &str) -> Option<&TabEntry> {
-        if self.tabs.get_index_of(id).is_none() {
-            return None;
-        }
+        self.tabs.get_index_of(id)?;
         self.active_id = Some(id.to_string());
         // LRU touch
         if let Some(idx) = self.tabs.get_index_of(id) {
@@ -117,18 +115,31 @@ pub struct TabSummary {
     pub active: bool,
 }
 
-/// Rate-limiter buckets keyed by (client_ip, route_template) — NOT raw path,
-/// so 404 dictionary scans can't grow the map unboundedly (audit §5.3).
+/// Rate-limiter buckets keyed by (client_identity, raw_path).
+///
+/// NOTE: the rate-limit middleware runs as a `Router::layer`, i.e. BEFORE
+/// route matching, so `MatchedPath` is never populated there and the key
+/// always uses the raw request path (audit HIGH-4). Unbounded growth from
+/// 404-scan path variants is contained by idle-bucket eviction in the
+/// middleware (cap 10k entries, 120s idle TTL).
+///
+/// client_identity is a hash of the presented `x-api-key` when present
+/// (all production clients share one tailnet tunnel IP — IP keying would
+/// let one client's burst throttle everyone else), else the socket IP.
 pub type RateBuckets = HashMap<
     (String, String),
-    governor::RateLimiter<
-        governor::state::NotKeyed,
-        governor::state::InMemoryState,
-        governor::clock::DefaultClock,
-    >,
+    (
+        governor::RateLimiter<
+            governor::state::NotKeyed,
+            governor::state::InMemoryState,
+            governor::clock::DefaultClock,
+        >,
+        // Last-seen instant, for idle eviction.
+        std::time::Instant,
+    ),
 >;
 
-/// Operational metrics (replaces the Python `_metrics` dict).
+/// Operational metrics (replaces the legacy `_metrics` dict).
 #[derive(Debug, Default)]
 pub struct Metrics {
     pub requests_total: u64,
@@ -152,10 +163,12 @@ pub struct BridgeState {
     /// Per-tab [ref=N] -> backendDOMNodeId mappers (perception plane)
     pub ax_mappers: Mutex<HashMap<String, AxMapper>>,
     /// X11 connection: std Mutex, NEVER held across .await (it's blocking X11 I/O)
+    #[allow(dead_code)] // parked: shared X11 connection for future visible-input batching
     pub x11: StdMutex<Option<x11rb::rust_connection::RustConnection>>,
     /// Shutdown flag for graceful teardown (audit BUG-4)
     pub shutting_down: std::sync::atomic::AtomicBool,
     /// Lease ID for internal bypass (empty = no bypass)
+    #[allow(dead_code)] // parked: internal bypass not yet enforced anywhere (audit LOW-1)
     pub internal_token: String,
 }
 
