@@ -1,15 +1,11 @@
-//! Browser launch and lifecycle (Phase 2).
+//! Browser lifecycle accessors.
 //!
-//! Replaces Playwright's `launch_persistent_context` with chromiumoxide's
-//! CDP launch. Key fixes vs. Python:
-//! - X11 readiness check BEFORE launch (audit: 31-min Overleaf fight started
-//!   with Chrome racing the X server)
-//! - Dedicated automation profile (NOT chrome-main clone — audit SEC-2)
-//! - Sandbox flags: keep --no-sandbox ONLY if running as non-root with
-//!   user namespaces available; document the tradeoff
-//! - Graceful shutdown: close all pages, then browser.close() (audit BUG-4)
+//! The supervisor task owns spawning and reconnecting (see `supervise.rs`).
+//! `ensure_browser` is the read path for routes: fast path when the browser
+//! is alive, bounded wait while the supervisor is (re)spawning.
+//!
+//! - X11 readiness check BEFORE first spawn (Chrome must never race the X server)
 
-use crate::config::Config;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,47 +36,10 @@ pub async fn wait_for_x11(dpy: &str) -> anyhow::Result<()> {
     anyhow::bail!("X11 display {} not ready after 30s", dpy)
 }
 
-/// Launch the persistent headed browser.
-/// Returns the chromiumoxide Browser handle.
-pub async fn launch(config: &Config) -> anyhow::Result<Arc<chromiumoxide::Browser>> {
-    wait_for_x11(&config.display).await?;
-
-    // Ensure profile dir exists
-    std::fs::create_dir_all(&config.profile_dir)?;
-
-    let (browser, _handler) = chromiumoxide::Browser::launch(
-        chromiumoxide::BrowserConfig::builder()
-            .chrome_executable(&config.chrome_bin)
-            .with_head()
-            .user_data_dir(&config.profile_dir)
-            .args(vec![
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-blink-features=AutomationControlled",
-                // Window geometry: pinned (0,0) 1920x1080 like the Python version
-                "--window-position=0,0",
-                "--window-size=1920,1080",
-                // Keep --no-sandbox: we run as non-root `auto` user in a VM;
-                // user namespaces may not be available. Documented tradeoff.
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ])
-            .build()
-            .map_err(|e| anyhow::anyhow!("browser config: {}", e))?,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("browser launch: {}", e))?;
-
-    tracing::info!("browser launched");
-
-    // Install new-document scripts on every page
-    // (FormGuard + diff observer — done per-page in routes for now)
-
-    Ok(Arc::new(browser))
-}
-
-/// Ensure the browser is running, launching if needed.
-/// Called at the start of every /browser/* handler.
+/// Ensure the browser is running. The supervisor task owns the lifecycle
+/// (spawn, connect, relaunch); this is the read path for routes: fast path
+/// when the browser is alive, bounded wait while the supervisor is
+/// (re)spawning. Called at the start of every /browser/* handler.
 pub async fn ensure_browser(
     state: &crate::state::SharedState,
 ) -> anyhow::Result<Arc<chromiumoxide::Browser>> {
@@ -93,17 +52,17 @@ pub async fn ensure_browser(
             }
         }
     }
-    // Slow path: launch (holds the lock to prevent duplicate launches —
-    // fixes the Python "two launches racing" bug)
-    let mut b = state.browser1.lock().await;
-    // Re-check under lock
-    if let Some(browser) = b.browser() {
-        if b.is_alive() {
-            return Ok(browser);
+    // Slow path: the supervisor is (re)spawning. Wait up to 60s rather
+    // than failing fast — a respawn is seconds, not minutes.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let b = state.browser1.lock().await;
+        if let Some(browser) = b.browser() {
+            if b.is_alive() {
+                return Ok(browser);
+            }
         }
     }
-    tracing::info!("launching browser (ensure_browser)");
-    let browser = launch(&state.config).await?;
-    b.set_browser(browser.clone());
-    Ok(browser)
+    anyhow::bail!("browser unavailable (supervisor still bringing it up)")
 }
