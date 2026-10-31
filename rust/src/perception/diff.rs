@@ -1,4 +1,4 @@
-//! MutationObserver DOM diffing (playbook §9).
+//! `MutationObserver` DOM diffing (playbook §9).
 //!
 //! Replaces redundant full-page snapshots after every action. The install
 //! script runs on every page load (via CDP `Page.addScriptToEvaluateOnNewDocument`);
@@ -15,7 +15,7 @@
 //! `ref_hint` is advisory, not a stable handle: an element `id` (`#foo`)
 //! when present, otherwise a compact `tag:nth-of-type` path. The agent uses
 //! it to find the node in the next AX snapshot, then addresses it by `[ref]`.
-//! Elements tagged `data-vm-internal="true"` (SoM overlay, Co-Pilot HUD) are
+//! Elements tagged `data-vm-internal="true"` (`SoM` overlay, Co-Pilot HUD) are
 //! never recorded.
 
 #![allow(dead_code)] // parked: DOM-diff observer not yet wired to any route (audit LOW-1)
@@ -37,7 +37,7 @@ pub struct DiffNode {
 
 /// Semantic DOM diff flushed after an action.
 ///
-/// Buckets mirror the MutationObserver record types; the per-record `type`
+/// Buckets mirror the `MutationObserver` record types; the per-record `type`
 /// field is stripped at flush time because the bucket already carries it.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct DomDiff {
@@ -64,7 +64,7 @@ impl DomDiff {
     }
 }
 
-/// Installs the MutationObserver + attribute watcher.
+/// Installs the `MutationObserver` + attribute watcher.
 ///
 /// Evaluated on every page load via `Page.addScriptToEvaluateOnNewDocument`.
 /// Idempotent per document (re-install returns `false`). Starts observing
@@ -180,7 +180,7 @@ pub const DIFF_INSTALL_JS: &str = r##"(() => {
 /// carries it). The queue is cleared atomically by the drain, so records are
 /// never double-reported. Evaluated after each action via
 /// `Runtime.evaluate`; deserialize into [`DomDiff`].
-pub const DIFF_FLUSH_JS: &str = r##"(() => {
+pub const DIFF_FLUSH_JS: &str = r#"(() => {
   const q = window.__vm_diff_queue || [];
   window.__vm_diff_queue = [];
   const out = { added: [], removed: [], mutated: [] };
@@ -190,12 +190,13 @@ pub const DIFF_FLUSH_JS: &str = r##"(() => {
     bucket.push({ ref_hint: r.ref_hint || "", role: r.role || "", name: r.name || "" });
   }
   return out;
-})()"##;
+})()"#;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[allow(clippy::assert_is_empty)] // is_empty() is clearer than assert_eq! against an empty array literal
     #[test]
     fn deserialize_full_diff() {
         let json = r##"{
