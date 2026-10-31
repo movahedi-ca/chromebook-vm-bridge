@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chromiumoxide::{Browser, Page};
+use chromiumoxide::Page;
 
 /// A single pooled context (isolated page on the main browser).
 pub struct PoolContext {
@@ -53,17 +53,21 @@ impl PoolState {
         true
     }
 
-    /// Close a page target when we are its last holder. In-flight handlers
-    /// hold their own clone; in that case the target stays open until the
-    /// browser dies, which is bounded by the pool cap.
-    async fn evict(&mut self, id: &str) {
-        if self.contexts.remove(id).is_some() {
-            tracing::debug!(context_id = %id, "pool context evicted");
-        }
+    /// Remove a context, returning its page. The caller MUST close the page
+    /// AFTER dropping the pool lock (audit 40 MED-3/MED-4: the lock is never
+    /// held across slow CDP calls). In-flight handlers hold their own clone;
+    /// in that case the target stays open until the browser dies, which is
+    /// bounded by the pool cap. Returns None for an unknown id (live
+    /// contexts always have a page, so None is unambiguous).
+    fn evict(&mut self, id: &str) -> Option<Arc<Page>> {
+        let ctx = self.contexts.remove(id)?;
+        tracing::debug!(context_id = %id, "pool context evicted");
+        ctx.page
     }
 
-    /// Prune TTL-expired contexts.
-    pub async fn prune(&mut self) {
+    /// Prune TTL-expired contexts. No CDP calls; returns pages for the
+    /// caller to close after dropping the lock.
+    pub fn prune(&mut self) -> Vec<Arc<Page>> {
         let now = Instant::now();
         let expired: Vec<String> = self
             .contexts
@@ -71,20 +75,20 @@ impl PoolState {
             .filter(|(_, c)| now.duration_since(c.last_used) > c.ttl)
             .map(|(id, _)| id.clone())
             .collect();
+        let mut pages = Vec::new();
         for id in expired {
-            self.evict(&id).await;
+            if let Some(p) = self.evict(&id) {
+                pages.push(p);
+            }
         }
+        pages
     }
 
-    /// Acquire a context: prune expired, LRU-evict past the cap, then open
-    /// a fresh blank page on the main browser. Returns the context id.
-    pub async fn acquire(
-        &mut self,
-        browser: &Arc<Browser>,
-        ttl_s: u64,
-        trace: bool,
-    ) -> anyhow::Result<String> {
-        self.prune().await;
+    /// Bookkeeping half of acquire: prune expired, LRU-evict past the cap.
+    /// No CDP calls. Returns pages the caller must close after dropping the
+    /// lock. Call BEFORE opening the new page (audit 40 MED-4).
+    pub fn prepare_acquire(&mut self) -> Vec<Arc<Page>> {
+        let mut to_close = self.prune();
         while self.contexts.len() >= self.max_contexts {
             let oldest = self
                 .contexts
@@ -92,28 +96,49 @@ impl PoolState {
                 .min_by_key(|(_, c)| c.last_used)
                 .map(|(id, _)| id.clone());
             match oldest {
-                Some(id) => self.evict(&id).await,
+                Some(id) => {
+                    if let Some(p) = self.evict(&id) {
+                        to_close.push(p);
+                    }
+                }
                 None => break,
             }
         }
-        let page = browser
-            .new_page("about:blank")
-            .await
-            .map_err(|e| anyhow::anyhow!("pool new_page: {}", e))?;
+        to_close
+    }
+
+    /// Register an already-opened page. No CDP calls. Returns the context id.
+    ///
+    /// Note: check-then-insert is no longer atomic with page creation (the
+    /// old atomicity required holding the lock across `new_page`, which
+    /// MED-4 forbids), so two concurrent acquires may transiently exceed the
+    /// cap by one; the next `prepare_acquire` corrects it.
+    pub fn register(&mut self, page: Arc<Page>, ttl_s: u64, trace: bool) -> String {
         let id: String = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         let ttl = Duration::from_secs(ttl_s.clamp(60, 3600));
         self.contexts.insert(
             id.clone(),
             PoolContext {
                 id: id.clone(),
-                page: Some(Arc::new(page)),
+                page: Some(page),
                 last_used: Instant::now(),
                 ttl,
                 trace,
             },
         );
         tracing::info!(context_id = %id, trace, "pool context acquired");
-        Ok(id)
+        id
+    }
+
+    /// Release a context, returning its page for the caller to close after
+    /// dropping the lock. Returns None for an unknown id. (Live contexts
+    /// always have a page, so a None return is unambiguous here.)
+    pub fn release(&mut self, id: &str) -> Option<Arc<Page>> {
+        if !self.contexts.contains_key(id) {
+            return None;
+        }
+        tracing::debug!(context_id = %id, "pool context released");
+        self.evict(id)
     }
 
     /// Look up a context's page, touching it for LRU/TTL purposes.
@@ -135,16 +160,6 @@ impl PoolState {
                 true
             }
             None => false,
-        }
-    }
-
-    /// Release a context, closing its page. Returns false if unknown.
-    pub async fn release(&mut self, id: &str) -> bool {
-        if self.contexts.contains_key(id) {
-            self.evict(id).await;
-            true
-        } else {
-            false
         }
     }
 }
