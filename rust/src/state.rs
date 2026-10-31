@@ -46,20 +46,27 @@ impl TabRegistry {
         }
     }
 
-    pub fn insert(&mut self, entry: TabEntry) {
+    /// Insert a tab, evicting LRU entries past capacity. Returns the evicted
+    /// pages: the caller must `close()` them AFTER dropping the tabs write
+    /// lock (audit 40 MED-3 — eviction must not leak Chrome targets, and the
+    /// lock is never held across the CDP close call).
+    pub fn insert(&mut self, entry: TabEntry) -> Vec<Arc<chromiumoxide::Page>> {
+        let mut evicted_pages = Vec::new();
         // Evict least-recently-used if at capacity
         while self.tabs.len() >= self.max_tabs {
-            if let Some((evicted_id, _)) = self.tabs.shift_remove_index(0) {
+            if let Some((evicted_id, evicted)) = self.tabs.shift_remove_index(0) {
                 tracing::info!(tab_id = %evicted_id, "evicted LRU tab");
                 if self.active_id.as_deref() == Some(&evicted_id) {
                     self.active_id = None;
                 }
+                evicted_pages.push(evicted.page);
             } else {
                 break;
             }
         }
         self.active_id = Some(entry.id.clone());
         self.tabs.insert(entry.id.clone(), entry);
+        evicted_pages
     }
 
     pub fn get(&mut self, id: &str) -> Option<&TabEntry> {
@@ -86,12 +93,19 @@ impl TabRegistry {
         self.get(&id)
     }
 
-    pub fn remove(&mut self, id: &str) -> Option<TabEntry> {
-        let entry = self.tabs.shift_remove(id);
-        if self.active_id.as_deref() == Some(id) {
-            self.active_id = self.tabs.keys().last().cloned();
-        }
-        entry
+    /// Read-only active lookup without the LRU touch, for read-only
+    /// endpoints (audit 40 MED-7): `active()` needs `&mut` for the touch.
+    pub fn active_ref(&self) -> Option<&TabEntry> {
+        let id = self.active_id.as_ref()?;
+        self.tabs.get(id)
+    }
+
+    /// Drop every tab entry (audit 40 HIGH-2). A browser relaunch invalidates
+    /// all page handles from the previous instance; serving them would 502
+    /// every tab-scoped endpoint until manual tab surgery.
+    pub fn clear(&mut self) {
+        self.tabs.clear();
+        self.active_id = None;
     }
 
     pub fn list(&self) -> Vec<TabSummary> {
