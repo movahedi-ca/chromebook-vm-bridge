@@ -27,13 +27,15 @@
 //! (`click_screen`, `double_click`, `move_to`).
 
 use crate::browser::actions::{
-    active_page, element_center, eval_json, insert_text, mouse_click, mouse_double_click,
-    mouse_drag, mouse_move, node_center, press_key,
+    active_page, element_center, eval_json, eval_json_async, insert_text, mouse_click,
+    mouse_double_click, mouse_drag, mouse_move, node_center, press_key, rdp_simplify,
 };
 use crate::browser::geometry::{
     clamp_to_viewport, viewport_to_screen, WindowGeometry, GEOMETRY_JS,
 };
-use crate::input::x11_mouse::{resolve_window_rect, X11Mouse};
+use crate::input::x11_mouse::{
+    park_x11_conn, refresh_window_rect, resolve_window_rect_on, take_x11_conn, X11Mouse,
+};
 use crate::interact::react::FILL_REACT_JS;
 use crate::state::SharedState;
 use axum::{
@@ -47,6 +49,8 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use x11rb::connection::Connection as _;
+use x11rb::rust_connection::RustConnection;
 
 /// Agreement tolerance between the page-reported window origin
 /// (`window.screenX/screenY`) and X11 ground truth (audit 42 Critical-1).
@@ -129,6 +133,11 @@ pub struct DragReq {
     pub points: Vec<Vec<f64>>,
     #[serde(default = "default_draw_speed")]
     pub draw_speed: f64,
+    /// OPT-IN Ramer-Douglas-Peucker simplification (epsilon 2px) before
+    /// the drag: fewer CDP MouseMoved events on dense polylines. Default
+    /// false — the default drag path sends every point exactly.
+    #[serde(default)]
+    pub simplify: bool,
 }
 
 #[derive(Deserialize)]
@@ -247,47 +256,106 @@ pub(crate) async fn visible_click(
         anyhow::bail!("visible input refused: lease changed mid-flight");
     }
     let display = state.config.display.clone();
-    // X11 ground truth for the gate rect. NEVER page JS.
-    let rect =
-        tokio::task::spawn_blocking(move || resolve_window_rect(Some(display.as_str()), pid))
-            .await
-            .map_err(|e| anyhow::anyhow!("window-resolve task failed: {e}"))?
-            .map_err(|e| anyhow::anyhow!("visible input refused: {e}"))?;
-    // Agreement: the page's story about the window origin must match X11.
-    // A hostile page reporting a shifted origin is refused loudly.
-    if (geom.screen_x - rect.x).abs() > WINDOW_ORIGIN_TOLERANCE_PX
-        || (geom.screen_y - rect.y).abs() > WINDOW_ORIGIN_TOLERANCE_PX
-    {
-        anyhow::bail!(
-            "visible input refused: page-reported origin ({},{}) disagrees with X11 ({},{})",
-            geom.screen_x,
-            geom.screen_y,
-            rect.x,
-            rect.y
-        );
-    }
-    // Viewport math anchored on the X11 rect: build a synthetic geometry
-    // whose origin/size are X11-derived and whose inner size is the page's
-    // CSS math. Page values can no longer move the rect.
-    let x11_w = i32::try_from(rect.w).unwrap_or(i32::MAX);
-    let x11_h = i32::try_from(rect.h).unwrap_or(i32::MAX);
-    let anchored = WindowGeometry {
-        screen_x: rect.x,
-        screen_y: rect.y,
-        outer_w: x11_w,
-        outer_h: x11_h,
-        inner_w: geom.inner_w,
-        inner_h: geom.inner_h,
-        device_pixel_ratio: geom.device_pixel_ratio,
-    };
-    let (sx, sy) = viewport_to_screen(vx.round() as i32, vy.round() as i32, &anchored);
-    let (sx, sy) = clamp_to_viewport(sx, sy, &anchored);
-    let display = state.config.display.clone();
+    let geom = *geom;
+    // ONE blocking section on the parked shared X11 connection (was: two
+    // separate TCP connects — one for the resolve, one for the mouse).
+    // The socket is reused; every query on it is FRESH, so the audit-42
+    // ground-truth property is unchanged: a moved window is re-resolved
+    // on every click, and the 32px agreement check below still compares
+    // the page's story against live X11 data.
+    let state_c = state.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<(i32, i32)> {
-        let mut mouse = X11Mouse::new(Some(display.as_str()))?;
-        mouse.set_window_rect(rect); // X11 ground truth ONLY — never page JS
-        mouse.click(sx, sy)?;
-        Ok((sx, sy))
+        let (conn, screen_num) = take_x11_conn(&state_c.x11, &display)?;
+        let outcome = (|| -> anyhow::Result<(i32, i32, RustConnection)> {
+            // Geometry fast path: the WINDOW ID is memoized (TTL 3s,
+            // invalidated when the page reports different viewport
+            // dimensions). The RECT is ALWAYS re-queried fresh from X11
+            // via `refresh_window_rect` — only the _NET_CLIENT_LIST walk
+            // is skipped. A moved window yields its current position;
+            // the 32px agreement check below still runs against live
+            // X11 data on every click, so a stale rect can never pass
+            // the gate (audit 42 Critical-1 preserved).
+            let vp = (geom.inner_w, geom.inner_h);
+            let cached: crate::state::GeomCache =
+                state_c.geom_cache.lock().ok().and_then(|g| *g);
+            let resolve_full = || {
+                resolve_window_rect_on(&conn, screen_num, pid).map_err(|e| {
+                    anyhow::anyhow!("visible input refused: window resolve failed: {e}")
+                })
+            };
+            let (_win, rect) = match cached {
+                Some((win, at, cached_vp))
+                    if at.elapsed() < Duration::from_secs(3) && cached_vp == vp =>
+                {
+                    match refresh_window_rect(&conn, screen_num, win, pid) {
+                        Ok(rect) => (win, rect),
+                        // Cached window went stale (recreated, PID
+                        // changed): fall back to the full walk and
+                        // re-memoize.
+                        Err(_) => {
+                            let (win, rect) = resolve_full()?;
+                            if let Ok(mut g) = state_c.geom_cache.lock() {
+                                *g = Some((win, std::time::Instant::now(), vp));
+                            }
+                            (win, rect)
+                        }
+                    }
+                }
+                _ => {
+                    let (win, rect) = resolve_full()?;
+                    if let Ok(mut g) = state_c.geom_cache.lock() {
+                        *g = Some((win, std::time::Instant::now(), vp));
+                    }
+                    (win, rect)
+                }
+            };
+            // Agreement: the page's story about the window origin must
+            // match X11. A hostile page reporting a shifted origin is
+            // refused loudly.
+            if (geom.screen_x - rect.x).abs() > WINDOW_ORIGIN_TOLERANCE_PX
+                || (geom.screen_y - rect.y).abs() > WINDOW_ORIGIN_TOLERANCE_PX
+            {
+                anyhow::bail!(
+                    "visible input refused: page-reported origin ({},{}) disagrees with X11 ({},{})",
+                    geom.screen_x,
+                    geom.screen_y,
+                    rect.x,
+                    rect.y
+                );
+            }
+            // Viewport math anchored on the X11 rect: build a synthetic
+            // geometry whose origin/size are X11-derived and whose inner
+            // size is the page's CSS math. Page values can no longer move
+            // the rect.
+            let x11_w = i32::try_from(rect.w).unwrap_or(i32::MAX);
+            let x11_h = i32::try_from(rect.h).unwrap_or(i32::MAX);
+            let anchored = WindowGeometry {
+                screen_x: rect.x,
+                screen_y: rect.y,
+                outer_w: x11_w,
+                outer_h: x11_h,
+                inner_w: geom.inner_w,
+                inner_h: geom.inner_h,
+                device_pixel_ratio: geom.device_pixel_ratio,
+            };
+            let (sx, sy) = viewport_to_screen(vx.round() as i32, vy.round() as i32, &anchored);
+            let (sx, sy) = clamp_to_viewport(sx, sy, &anchored);
+            let root = conn.setup().roots[screen_num].root;
+            let mut mouse = X11Mouse::from_conn(conn, root);
+            mouse.set_window_rect(rect); // X11 ground truth ONLY — never page JS
+            mouse.click(sx, sy)?;
+            let conn = mouse.into_conn();
+            Ok((sx, sy, conn))
+        })();
+        match outcome {
+            Ok((sx, sy, conn)) => {
+                park_x11_conn(&state_c.x11, &display, conn, screen_num);
+                Ok((sx, sy))
+            }
+            // Drop the socket on any error: the next click reconnects
+            // rather than reusing a potentially desynced connection.
+            Err(e) => Err(e),
+        }
     })
     .await
     .map_err(|e| anyhow::anyhow!("visible click task failed: {e}"))?
@@ -326,15 +394,23 @@ async fn read_target_value(page: &Page, selector: &str) -> anyhow::Result<String
 /// Set a form control's value through the React-native-prototype primitive
 /// (native value setter + bubbling input/change/blur), returning the
 /// read-back `el.value`.
-async fn fill_react(page: &Page, selector: &str, text: &str) -> anyhow::Result<String> {
+///
+/// Merged single-evaluation variant: `el.focus()`, one microtask yield so
+/// framework `onFocus` handlers (MUI, Radix, AntD) flush before the value
+/// mutation, then the native setter — all in one CDP round trip instead of
+/// the old focus-then-fill two-eval sequence. `FILL_REACT_JS` stays the
+/// single source of truth for the setter itself.
+async fn fill_react_merged(page: &Page, selector: &str, text: &str) -> anyhow::Result<String> {
     let sel_lit =
         serde_json::to_string(selector).map_err(|e| anyhow::anyhow!("selector literal: {e}"))?;
     let text_lit = serde_json::to_string(text).map_err(|e| anyhow::anyhow!("text literal: {e}"))?;
     let js = format!(
-        "(() => {{ const el = document.querySelector({sel_lit}); if (!el) return null; \
-           const fill = {FILL_REACT_JS}; return fill(el, {text_lit}); }})()"
+        "(async () => {{ const el = document.querySelector({sel_lit}); if (!el) return null; \
+           el.focus(); await Promise.resolve(); \
+           const fill = {fill_js}; return fill(el, {text_lit}); }})()",
+        fill_js = FILL_REACT_JS
     );
-    let v = eval_json(page, &js).await?;
+    let v = eval_json_async(page, &js).await?;
     if v.is_null() {
         anyhow::bail!("no element matches selector: {selector}");
     }
@@ -342,9 +418,14 @@ async fn fill_react(page: &Page, selector: &str, text: &str) -> anyhow::Result<S
 }
 
 /// Click an element (center of its bounding box) then insert text at it.
-async fn click_then_type(page: &Page, selector: &str, text: &str) -> anyhow::Result<()> {
+async fn click_then_type(
+    page: &Page,
+    selector: &str,
+    text: &str,
+    timing: crate::browser::actions::ClickTiming,
+) -> anyhow::Result<()> {
     let (x, y) = element_center(page, selector).await?;
-    mouse_click(page, x, y).await?;
+    mouse_click(page, x, y, timing).await?;
     insert_text(page, text).await?;
     Ok(())
 }
@@ -412,9 +493,12 @@ pub async fn click(
                 Json(json!({"ok": true, "at": {"x": sx, "y": sy}, "mode": "visible"})),
             ))
         } else {
-            tokio::time::timeout(Duration::from_secs(30), mouse_click(&page, x, y))
-                .await
-                .map_err(|_| anyhow::anyhow!("click timed out"))??;
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                mouse_click(&page, x, y, state.click_timing()),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("click timed out"))??;
             Ok((
                 StatusCode::OK,
                 Json(json!({"ok": true, "at": {"x": x.round(), "y": y.round()}, "mode": "native"})),
@@ -435,9 +519,12 @@ pub async fn click_at(
 ) -> impl IntoResponse {
     let res: anyhow::Result<(StatusCode, Json<serde_json::Value>)> = async {
         let page = active_page(&state).await?;
-        tokio::time::timeout(Duration::from_secs(30), mouse_click(&page, req.x, req.y))
-            .await
-            .map_err(|_| anyhow::anyhow!("click_at timed out"))??;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            mouse_click(&page, req.x, req.y, state.click_timing()),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("click_at timed out"))??;
         Ok((
             StatusCode::OK,
             Json(json!({"ok": true, "at": {"x": req.x, "y": req.y}})),
@@ -464,7 +551,7 @@ pub async fn click_node(
         )
         .await
         .map_err(|_| anyhow::anyhow!("node_center timed out"))??;
-        mouse_click(&page, x, y).await?;
+        mouse_click(&page, x, y, state.click_timing()).await?;
         Ok((
             StatusCode::OK,
             Json(json!({"ok": true, "at": {"x": x.round(), "y": y.round()}})),
@@ -486,9 +573,12 @@ pub async fn click_screen(
     let res: anyhow::Result<(StatusCode, Json<serde_json::Value>)> = async {
         let page = active_page(&state).await?;
         let (vx, vy) = screen_to_viewport(&page, req.x, req.y).await?;
-        tokio::time::timeout(Duration::from_secs(30), mouse_click(&page, vx, vy))
-            .await
-            .map_err(|_| anyhow::anyhow!("click_screen timed out"))??;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            mouse_click(&page, vx, vy, state.click_timing()),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("click_screen timed out"))??;
         Ok((
             StatusCode::OK,
             Json(json!({"ok": true, "at": {"x": req.x, "y": req.y}})),
@@ -510,9 +600,12 @@ pub async fn double_click(
     let res: anyhow::Result<(StatusCode, Json<serde_json::Value>)> = async {
         let page = active_page(&state).await?;
         let (vx, vy) = screen_to_viewport(&page, req.x, req.y).await?;
-        tokio::time::timeout(Duration::from_secs(30), mouse_double_click(&page, vx, vy))
-            .await
-            .map_err(|_| anyhow::anyhow!("double_click timed out"))??;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            mouse_double_click(&page, vx, vy, state.click_timing()),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("double_click timed out"))??;
         Ok((
             StatusCode::OK,
             Json(json!({"ok": true, "at": {"x": req.x, "y": req.y}})),
@@ -557,13 +650,22 @@ pub async fn drag(State(state): State<SharedState>, Json(req): Json<DragReq>) ->
     }
     let res: anyhow::Result<(StatusCode, Json<serde_json::Value>)> = async {
         let page = active_page(&state).await?;
+        // OPT-IN ONLY: RDP simplification. Default path sends every
+        // point exactly (drag precision matters).
+        let original_len = pts.len();
+        let pts = if req.simplify {
+            rdp_simplify(&pts, 2.0)
+        } else {
+            pts
+        };
         tokio::time::timeout(Duration::from_secs(120), mouse_drag(&page, &pts))
             .await
             .map_err(|_| anyhow::anyhow!("drag timed out"))??;
-        Ok((
-            StatusCode::OK,
-            Json(json!({"ok": true, "points": pts.len()})),
-        ))
+        let mut body = json!({"ok": true, "points": pts.len()});
+        if req.simplify {
+            body["simplified_from"] = json!(original_len);
+        }
+        Ok((StatusCode::OK, Json(body)))
     }
     .await;
     match res {
@@ -671,7 +773,7 @@ pub async fn fill(State(state): State<SharedState>, Json(req): Json<FillReq>) ->
         focus_element(&page, &req.selector).await?;
         let value = tokio::time::timeout(
             Duration::from_secs(30),
-            fill_react(&page, &req.selector, &req.text),
+            fill_react_merged(&page, &req.selector, &req.text),
         )
         .await
         .map_err(|_| anyhow::anyhow!("fill timed out"))??;
@@ -697,7 +799,7 @@ pub async fn type_text(
         let page = active_page(&state).await?;
         tokio::time::timeout(
             Duration::from_secs(60),
-            click_then_type(&page, &req.selector, &req.text),
+            click_then_type(&page, &req.selector, &req.text, state.click_timing()),
         )
         .await
         .map_err(|_| anyhow::anyhow!("type timed out"))??;
@@ -721,14 +823,14 @@ pub async fn type_verified(
         let page = active_page(&state).await?;
         tokio::time::timeout(
             Duration::from_secs(60),
-            click_then_type(&page, &req.selector, &req.text),
+            click_then_type(&page, &req.selector, &req.text, state.click_timing()),
         )
         .await
         .map_err(|_| anyhow::anyhow!("type timed out"))??;
         let mut value = read_target_value(&page, &req.selector).await?;
         if value != req.text {
             // One retry: re-focus and insert again.
-            click_then_type(&page, &req.selector, &req.text).await?;
+            click_then_type(&page, &req.selector, &req.text, state.click_timing()).await?;
             value = read_target_value(&page, &req.selector).await?;
         }
         let verified = value == req.text;
@@ -767,6 +869,46 @@ pub async fn press(
 
 /// POST /browser/wait — {selector, `timeout_ms`}. Polls every 250ms for the
 /// selector to appear; an empty selector just sleeps the timeout.
+/// Wait for a selector to appear, event-driven.
+///
+/// A single CDP evaluation awaits a promise that a `MutationObserver`
+/// resolves the moment the selector matches — no 250 ms poll loop, no
+/// per-poll CDP round trips. The in-page timer enforces the timeout; the
+/// Rust-side timeout is a backstop. Presence semantics match the old
+/// poller (`querySelector(...) !== null`).
+async fn wait_for_selector(
+    page: &chromiumoxide::Page,
+    selector: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<bool> {
+    let sel_lit =
+        serde_json::to_string(selector).map_err(|e| anyhow::anyhow!("selector literal: {e}"))?;
+    let js = format!(
+        r#"(async () => {{
+            const sel = {sel_lit};
+            const q = () => document.querySelector(sel) !== null;
+            if (q()) return true;
+            return new Promise((resolve) => {{
+                const timer = setTimeout(() => {{ obs.disconnect(); resolve(false); }}, {timeout_ms});
+                const obs = new MutationObserver(() => {{
+                    if (q()) {{ clearTimeout(timer); obs.disconnect(); resolve(true); }}
+                }});
+                obs.observe(document.documentElement, {{
+                    childList: true, subtree: true, attributes: true,
+                    attributeFilter: ['style', 'class', 'hidden', 'disabled']
+                }});
+            }});
+        }})()"#
+    );
+    let v = tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms.saturating_add(5_000)),
+        eval_json_async(page, &js),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("wait timed out"))??;
+    Ok(v.as_bool().unwrap_or(false))
+}
+
 pub async fn wait(State(state): State<SharedState>, Json(req): Json<WaitReq>) -> impl IntoResponse {
     // Clamp: an unclamped timeout_ms lets a client park a worker (audit 40
     // LOW-7). The 120s TimeoutLayer is the absolute backstop, so the
@@ -779,21 +921,8 @@ pub async fn wait(State(state): State<SharedState>, Json(req): Json<WaitReq>) ->
             tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
             return Ok((StatusCode::OK, Json(json!({"ok": true, "found": true}))));
         }
-        let sel_lit = serde_json::to_string(&req.selector)
-            .map_err(|e| anyhow::anyhow!("selector literal: {e}"))?;
-        let js = format!("document.querySelector({sel_lit}) !== null");
         let page = active_page(&state).await?;
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
-        let found = loop {
-            let v = eval_json(&page, &js).await?;
-            if v.as_bool().unwrap_or(false) {
-                break true;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                break false;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        };
+        let found = wait_for_selector(&page, &req.selector, timeout_ms).await?;
         Ok((StatusCode::OK, Json(json!({"ok": true, "found": found}))))
     }
     .await;
