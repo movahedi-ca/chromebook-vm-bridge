@@ -3,7 +3,7 @@
 //! This is the inner supervision ring (systemd is the outer one). The
 //! supervisor spawns the browser at startup, connects the CDP driver,
 //! watches the child process, and relaunches with capped backoff when it
-//! dies. It talks only to [`BrowserBackend`](super::backend::BrowserBackend),
+//! dies. It talks only to [`BrowserBackend`],
 //! never to an engine directly.
 //!
 //! Health is split in two on purpose:
@@ -47,7 +47,7 @@ async fn connect_driver(
     )
     .await
     .map_err(|_| anyhow::anyhow!("CDP connect timed out"))?
-    .map_err(|e| anyhow::anyhow!("CDP connect failed: {}", e))?;
+    .map_err(|e| anyhow::anyhow!("CDP connect failed: {e}"))?;
     // The handler MUST be polled or the connection silently dies.
     spawn_handler(handler);
     let browser = Arc::new(browser);
@@ -59,26 +59,23 @@ async fn connect_driver(
         Ok::<(), anyhow::Error>(())
     })
     .await;
-    match smoke {
-        Ok(Ok(())) => {
-            state.browser1.lock().await.set_browser(browser);
-            // A new browser instance invalidates every tab handle and ref
-            // mapping from the previous one (audit 40 HIGH-2). Without this,
-            // active_page() serves stale Arc<Page> handles and all /browser/*
-            // routes 502 until manual tab surgery. On first boot the
-            // registry is empty, so this is a no-op there.
-            {
-                let mut tabs = state.tabs.write().await;
-                tabs.clear();
-            }
-            state.ax_mappers.lock().await.clear();
-            Ok(())
+    if let Ok(Ok(())) = smoke {
+        state.browser1.lock().await.set_browser(browser);
+        // A new browser instance invalidates every tab handle and ref
+        // mapping from the previous one (audit 40 HIGH-2). Without this,
+        // active_page() serves stale Arc<Page> handles and all /browser/*
+        // routes 502 until manual tab surgery. On first boot the
+        // registry is empty, so this is a no-op there.
+        {
+            let mut tabs = state.tabs.write().await;
+            tabs.clear();
         }
-        _ => {
-            tracing::warn!("browser failed CDP smoke test; killing for a clean respawn");
-            backend.kill().await;
-            anyhow::bail!("browser wedged (smoke test failed)")
-        }
+        state.ax_mappers.lock().await.clear();
+        Ok(())
+    } else {
+        tracing::warn!("browser failed CDP smoke test; killing for a clean respawn");
+        backend.kill().await;
+        anyhow::bail!("browser wedged (smoke test failed)")
     }
 }
 
@@ -112,23 +109,40 @@ pub async fn run_supervisor(mut backend: Box<dyn BrowserBackend>, state: SharedS
                 backend.ensure_running(&cfg).await?;
                 connect_driver(&state, &mut *backend, &cfg).await
             };
-            match bring_up.await {
-                Ok(()) => {
-                    failures = 0;
-                    if booted {
-                        state.metrics.lock().await.relaunches += 1;
-                        tracing::warn!("browser relaunched and healthy");
-                    } else {
-                        tracing::info!("browser online");
-                    }
-                    booted = true;
+            // Bring-up is slow (port wait + CDP connect + smoke ≈ 55s worst
+            // case). If shutdown lands mid-bring-up, abort instead of
+            // finishing the spawn and orphaning Chrome (audit 41 LOW-12).
+            let shutdown_watch = async {
+                while !state.shutting_down.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
                 }
-                Err(e) => {
-                    failures = failures.saturating_add(1);
-                    let backoff = std::cmp::min(MAX_BACKOFF_SECS, 1u64 << failures.min(5));
-                    tracing::error!(error = %e, "browser bring-up failed; retry in {}s", backoff);
-                    tokio::time::sleep(Duration::from_secs(backoff)).await;
-                    continue;
+            };
+            tokio::select! {
+                res = bring_up => {
+                    match res {
+                        Ok(()) => {
+                            failures = 0;
+                            if booted {
+                                state.metrics.lock().await.relaunches += 1;
+                                tracing::warn!("browser relaunched and healthy");
+                            } else {
+                                tracing::info!("browser online");
+                            }
+                            booted = true;
+                        }
+                        Err(e) => {
+                            failures = failures.saturating_add(1);
+                            let backoff = std::cmp::min(MAX_BACKOFF_SECS, 1u64 << failures.min(5));
+                            tracing::error!(error = %e, "browser bring-up failed; retry in {}s", backoff);
+                            tokio::time::sleep(Duration::from_secs(backoff)).await;
+                            continue;
+                        }
+                    }
+                }
+                () = shutdown_watch => {
+                    tracing::info!("supervisor: shutdown during bring-up; killing browser");
+                    backend.kill().await;
+                    break;
                 }
             }
         }
