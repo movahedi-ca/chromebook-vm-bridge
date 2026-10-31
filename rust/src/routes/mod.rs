@@ -1,6 +1,7 @@
 //! Route handlers.
 
 pub mod advanced;
+pub mod batch;
 pub mod browser;
 pub mod input;
 pub mod lease;
