@@ -62,6 +62,16 @@ async fn connect_driver(
     match smoke {
         Ok(Ok(())) => {
             state.browser1.lock().await.set_browser(browser);
+            // A new browser instance invalidates every tab handle and ref
+            // mapping from the previous one (audit 40 HIGH-2). Without this,
+            // active_page() serves stale Arc<Page> handles and all /browser/*
+            // routes 502 until manual tab surgery. On first boot the
+            // registry is empty, so this is a no-op there.
+            {
+                let mut tabs = state.tabs.write().await;
+                tabs.clear();
+            }
+            state.ax_mappers.lock().await.clear();
             Ok(())
         }
         _ => {
