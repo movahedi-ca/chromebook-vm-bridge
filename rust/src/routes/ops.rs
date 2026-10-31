@@ -1,4 +1,4 @@
-//! Ops route handlers: health, metrics, render_package.
+//! Ops route handlers: health, metrics, `render_package`.
 
 use crate::state::SharedState;
 use axum::{extract::State, response::IntoResponse, Json};
@@ -16,10 +16,7 @@ pub async fn health(State(state): State<SharedState>) -> impl IntoResponse {
         "version": env!("CARGO_PKG_VERSION"),
         "browser_alive": browser_alive,
         "tab_count": tabs.list().len(),
-        "uptime_s": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
+        "uptime_s": state.started_at.elapsed().as_secs(),
         // Redacted: no last_action, no URLs, no lease IDs (audit SEC-8)
         "requests_total": metrics.requests_total,
         "requests_4xx": metrics.requests_4xx,
@@ -42,13 +39,15 @@ pub async fn metrics(State(state): State<SharedState>) -> impl IntoResponse {
     }))
 }
 
-/// POST /ops/render_package — returns the Co-Pilot HUD render package
-/// (playbook §10: /ops/render_package). ADMIN scope required (see auth.rs).
+/// POST /`ops/render_package` — returns the Co-Pilot HUD render package
+/// (playbook §10: /`ops/render_package`). ADMIN scope required (see auth.rs).
 pub async fn render_package(State(state): State<SharedState>) -> impl IntoResponse {
     // The HUD state is managed separately; this returns the current
     // render-ready package for external dashboards.
-    let tabs = state.tabs.read().await;
+    // Respect the documented lock order: browser1 -> tabs (state.rs).
+    // (audit 41 LOW-8: this handler used to take tabs before browser1.)
     let browser_alive = state.browser1.lock().await.is_alive();
+    let tabs = state.tabs.read().await;
 
     Json(json!({
         "ok": true,
