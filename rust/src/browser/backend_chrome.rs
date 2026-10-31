@@ -29,6 +29,9 @@ const CHROME_FLAGS: &[&str] = &[
     "--window-size=1920,1080",
     "--disable-dev-shm-usage",
     "--disable-gpu",
+    // Re-enable SwiftShader software WebGL (Chrome 128+ disables it under
+    // --disable-gpu without this). Needed by WebGL apps like jspaint.app.
+    "--enable-unsafe-swiftshader",
     "--disable-background-timer-throttling",
     "--disable-backgrounding-occluded-windows",
     "--disable-renderer-backgrounding",
