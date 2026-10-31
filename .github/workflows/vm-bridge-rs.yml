@@ -1,12 +1,12 @@
 name: vm-bridge-rs CI
 
+# No paths filter (audit MED-9): changes to agent/, docs/, the systemd unit,
+# or this workflow itself must also trigger CI.
 on:
   push:
-    paths:
-      - 'rust/**'
+    branches: [main]
   pull_request:
-    paths:
-      - 'rust/**'
+    branches: [main]
 
 jobs:
   build:
@@ -39,6 +39,18 @@ jobs:
       - name: Unit tests
         run: cargo test
 
-  # Contract tests run on the VM (needs Chrome + X11), not in CI.
-  # See rust/tests/ for the contract suite; run via:
-  #   ./scripts/run-contract-tests.sh
+  # Contract tests need a live Chrome + X11, so they run on the VM, not in
+  # CI. (There is no rust/tests/ or scripts/run-contract-tests.sh in this
+  # repo — the VM-side smoke is: start the service, GET /health, POST
+  # /browser/navigate to https://example.com, GET /browser/snapshot.)
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ShellCheck agent scripts
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: './agent'
+          severity: warning
