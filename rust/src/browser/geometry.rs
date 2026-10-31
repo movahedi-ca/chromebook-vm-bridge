@@ -9,13 +9,13 @@
 //! JS-derived offset cache with `root.translate_coords(win, 0, 0)`. In
 //! Xlib, `src.translate_coords(dst, x, y)` translates coordinates
 //! *from the receiver* into the destination's space, so that call answered
-//! "where is the root origin inside the window's frame" (~(-win_x, -win_y)),
+//! "where is the root origin inside the window's frame" (~(-`win_x`, -`win_y`)),
 //! not "where is the window on the screen". Every visible click then missed
 //! whenever Chrome was not at (0,0).
 //!
 //! The Xlib `translate_coords` path is DELETED here and must never come back.
 //! Screen coordinates are computed ONLY from a fresh [`GEOMETRY_JS`]
-//! evaluation immediately before each visible (XTest) action.
+//! evaluation immediately before each visible (`XTest`) action.
 //!
 //! ## The `no_viewport` 1:1 assumption
 //!
@@ -24,11 +24,11 @@
 //! device-metric override, so **CSS pixels == physical X11 pixels** and
 //! `window.innerWidth/innerHeight` are already in screen pixels.
 //!
-//! If `window.deviceScaleFactor != 1` (HiDPI) or the legacy driver-style emulation
+//! If `window.deviceScaleFactor != 1` (`HiDPI`) or the legacy driver-style emulation
 //! is ever enabled, every coordinate here is wrong by that factor. (An older
 //! revision of these docs claimed the watchdog asserted
 //! `deviceScaleFactor == 1` at startup; no such check exists — audit LOW-7.
-//! If HiDPI ever becomes a deployment reality, add the assert to the
+//! If `HiDPI` ever becomes a deployment reality, add the assert to the
 //! supervisor's connect step and refuse visible input when it fails,
 //! rather than clicking blind.)
 
@@ -70,21 +70,21 @@ pub struct WindowGeometry {
 ///
 /// Evaluate fresh every time — never cache across navigations, resizes, or
 /// tab switches. A stale cache is exactly what BUG-1 was.
-pub const GEOMETRY_JS: &str = r#"(() => ({
+pub const GEOMETRY_JS: &str = r"(() => ({
     screenX: window.screenX,
     screenY: window.screenY,
     outerWidth: window.outerWidth,
     outerHeight: window.outerHeight,
     innerWidth: window.innerWidth,
     innerHeight: window.innerHeight,
-}))()"#;
+}))()";
 
 impl WindowGeometry {
     /// Screen X of the viewport origin (left window border width).
     ///
     /// Assumes symmetric left/right borders: `(outer_w - inner_w) / 2`.
     /// Integer division floors; a 1px error here is harmless because the
-    /// result is clamped to the viewport rect before any XTest call.
+    /// result is clamped to the viewport rect before any `XTest` call.
     /// Saturating: pathological geometry can never wrap into a wild
     /// coordinate (debug builds panic on overflow — this must not).
     pub fn origin_x(&self) -> i32 {
@@ -111,7 +111,7 @@ impl WindowGeometry {
 ///
 /// Uses saturating arithmetic so pathological geometry can never wrap into
 /// a wild coordinate. Callers must still pass the result through
-/// [`clamp_to_viewport`] before handing it to XTest.
+/// [`clamp_to_viewport`] before handing it to `XTest`.
 pub fn viewport_to_screen(viewport_x: i32, viewport_y: i32, geom: &WindowGeometry) -> (i32, i32) {
     (
         geom.origin_x().saturating_add(viewport_x),
@@ -122,7 +122,7 @@ pub fn viewport_to_screen(viewport_x: i32, viewport_y: i32, geom: &WindowGeometr
 /// Clamp a screen point into the inner viewport rectangle
 /// `[origin_x, origin_x + inner_w - 1] x [origin_y, origin_y + inner_h - 1]`.
 ///
-/// This is the SEC-1 guard: XTest must never drive the pointer outside the
+/// This is the SEC-1 guard: `XTest` must never drive the pointer outside the
 /// Chrome window (no clicking terminals, file managers, or password dialogs
 /// on the shared :1 display). The `-1` keeps the clamped point strictly
 /// inside the viewport instead of on its far edge.
@@ -138,9 +138,9 @@ pub fn clamp_to_viewport(x: i32, y: i32, geom: &WindowGeometry) -> (i32, i32) {
 ///
 /// Replaces the old hardcoded `(683, 450)` — the center of a 1366x900 laptop
 /// screen that had no business being in this codebase. The caller moves BOTH
-/// the XTest pointer (screen coords via [`viewport_to_screen`]) and the CDP
+/// the `XTest` pointer (screen coords via [`viewport_to_screen`]) and the CDP
 /// mouse to this point before dispatching the wheel event (audit H4: the old
-/// code moved only the XTest cursor while `page.mouse.wheel` fired at
+/// code moved only the `XTest` cursor while `page.mouse.wheel` fired at
 /// the legacy driver's unmoved virtual position).
 #[allow(dead_code)] // parked: scroll-center helper for a future visible-scroll path (audit LOW-1)
 pub fn scroll_center(geom: &WindowGeometry) -> (i32, i32) {
