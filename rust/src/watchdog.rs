@@ -104,21 +104,16 @@ pub async fn run(state: SharedState) {
 }
 
 /// Lightweight browser probe: evaluate "1" via CDP with a hard timeout.
-async fn probe_browser(
-    browser: std::sync::Arc<chromiumoxide::Browser>,
-    timeout: Duration,
-) -> bool {
+async fn probe_browser(browser: std::sync::Arc<chromiumoxide::Browser>, timeout: Duration) -> bool {
+    // Cheap liveness check: Browser::version() is a browser-level CDP call
+    // (Browser.getVersion) that creates no target, unlike the old
+    // new_page("about:blank") probe which churned target IDs every tick
+    // (audit LOW-3).
     let fut = async {
-        // Create a throwaway target, evaluate, close it
-        let page = browser.new_page("about:blank").await.map_err(|_| ())?;
-        page.evaluate("1").await.map_err(|_| ())?;
-        let _ = page.close().await;
+        browser.version().await.map_err(|_| ())?;
         Ok::<(), ()>(())
     };
-    match tokio::time::timeout(timeout, fut).await {
-        Ok(Ok(())) => true,
-        _ => false,
-    }
+    matches!(tokio::time::timeout(timeout, fut).await, Ok(Ok(())))
 }
 
 /// Mark the browser dead so the supervisor respawns it. Called with
