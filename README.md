@@ -1,6 +1,6 @@
 # vm-bridge
 
-A FastAPI + Playwright bridge that exposes a headed Chrome browser running on a
+A Rust (axum + tokio) bridge that exposes a headed Chrome browser running on a
 Linux VM as an HTTP API, so agents can drive a real browser (with the user's own
 signed-in sessions) without touching the user's own machine.
 
@@ -10,39 +10,42 @@ an SSH tunnel or the tailnet proxy.
 
 ## What it does
 
-- Drives a persistent headed Chromium via Playwright against a copy of the
+- Drives a persistent headed Chromium via CDP against a copy of the
   user's real Chrome profile, so logins persist.
 - REST endpoints for navigation, clicking, typing, screenshots, DOM snapshots,
   tab management, and an order-smart element resolver (deterministic
   nodeId-first, with optional LLM escalation via accessibility snapshot).
-- Headless context pool (max 3, LRU) for parallel background work, with
+- Context pool (max 3, LRU) for parallel background work, with
   resource blocking and failure screenshots.
-- Human-like mouse movement (`human_mouse.py`) with eased trajectories, for
+- Human-like mouse movement with eased trajectories, for
   interactions that need to look natural.
-- Hardening: X-API-Key auth, per-path token-bucket rate limiting, JSON request
-  logging, body-size caps, lease manager for exclusive sessions, SSIM
-  visual-assertion endpoint, crash watchdog with auto-relaunch.
+- Hardening: X-API-Key auth (scoped keys: read/act/admin), per-path token-bucket
+  rate limiting, JSON request logging, body-size caps, lease manager for
+  exclusive sessions, SSIM visual-assertion endpoint, crash watchdog with
+  auto-relaunch, SSRF firewall.
+- MCP server (`--mcp-stdio`) with 10 tools for agent integration.
+- Perception plane: AX snapshot with stable `[ref]` handles, screenshot
+  comparison, visual assertions.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `app.py` | The bridge: FastAPI app, all endpoints, tab LRU, lease manager, rate limits |
-| `human_mouse.py` | Eased mouse trajectories (Mona Lisa smoothness-gated) |
-| `vm-bridge.service` | systemd unit (localhost:8899, auto-restart, watchdog) |
+| `rust/` | The bridge: axum app, all endpoints, tab LRU, lease manager, rate limits, MCP server |
+| `rust/systemd/vm-bridge-rs.service` | systemd unit (localhost:8899, auto-restart, watchdog) |
 | `docs/chromebook-vm-setup.md` | The host VM's overall setup: hardware, display, services, secrets handling |
-| `agent/` | Orchestrator-side tooling: hardened SSH wrapper, job protocol, rsync transfer, typed bridge CLI (no secrets; host via `CB_HOST`) |
-| `rust/` | Rust rewrite (axum + tokio): scoped keys, SSRF firewall, perception plane, MCP server |
+| `agent/` | Orchestrator-side tooling: hardened SSH wrapper, job protocol, rsync transfer (no secrets; host via `CB_HOST`) |
+| `.github/workflows/vm-bridge-rs.yml` | CI: build, test, clippy, fmt |
 
 ## Setup
 
-1. Copy the files to the VM, install Python deps (`fastapi`, `uvicorn`,
-   `playwright`, plus a Playwright Chromium build).
-2. Set `BRIDGE_API_KEY` in the environment (see the systemd unit's
-   `EnvironmentFile`; never hardcode it).
+1. Build the release binary: `cargo build --release` (in `rust/`).
+2. Set `BRIDGE_API_KEY` in `~/.config/vm-bridge/env` (mode 600; see the systemd
+   unit's `EnvironmentFile`; never hardcode it).
 3. Copy your Chrome profile to the configured profile dir so signed-in
    sessions are available.
-4. `systemctl enable --now vm-bridge.service`
+4. Install the systemd unit: copy `rust/systemd/vm-bridge-rs.service` to
+   `~/.config/systemd/user/`, then `systemctl --user enable --now vm-bridge-rs.service`.
 
 Every request carries `X-API-Key: <key>`, except `/health`.
 
@@ -53,3 +56,5 @@ Every request carries `X-API-Key: <key>`, except `/health`.
 - The key lives in an EnvironmentFile with mode 600, never in the code.
 - Persistent profile copies mean anyone with bridge access inherits the
   browser's sessions. Treat the key like a password.
+- Scoped keys (`VM_BRIDGE_KEYS__READ/ACT/ADMIN`) provide least-privilege
+  access; `BRIDGE_API_KEY` grants full scope for drop-in compatibility.
