@@ -16,7 +16,7 @@ pub struct Config {
     pub bind_port: u16,
 
     /// Scoped API keys. Server refuses to start if any required key is unset.
-    /// Falls back to BRIDGE_API_KEY when unset (see Config::load).
+    /// Falls back to `BRIDGE_API_KEY` when unset (see `Config::load`).
     #[serde(default)]
     pub keys: ApiKeys,
 
@@ -46,7 +46,7 @@ pub struct Config {
     /// Upload staging allowlist
     pub upload_dirs: Vec<PathBuf>,
 
-    /// FormGuard vault path
+    /// `FormGuard` vault path
     #[allow(dead_code)] // vault is parked (audit HIGH-2)
     pub vault_path: PathBuf,
 
@@ -70,9 +70,8 @@ pub struct ApiKeys {
 
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
-        let cfg_dir = dirs::config_dir()
-            .map(|d| d.join("vm-bridge"))
-            .unwrap_or_else(|| PathBuf::from("."));
+        let cfg_dir =
+            dirs::config_dir().map_or_else(|| PathBuf::from("."), |d| d.join("vm-bridge"));
 
         let mut builder = config::Config::builder();
 
@@ -150,6 +149,8 @@ impl Config {
         {
             if let Ok(legacy) = std::env::var("BRIDGE_API_KEY") {
                 let legacy = legacy.trim().to_string();
+                // legacy is fanned out to three independent scope keys; the clones are necessary.
+                #[allow(clippy::assigning_clones)]
                 if !legacy.is_empty() {
                     if cfg.keys.read.trim().is_empty() {
                         cfg.keys.read = legacy.clone();
