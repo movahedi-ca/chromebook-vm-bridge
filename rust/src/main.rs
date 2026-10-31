@@ -72,11 +72,17 @@ async fn main() -> anyhow::Result<()> {
         dirs.extend(config.upload_dirs.iter().map(std::path::PathBuf::as_path));
         for dir in dirs {
             std::fs::create_dir_all(dir)?;
+            // Best-effort mode 700 (audit SEC-8): under systemd's
+            // ProtectHome=read-only + ReadWritePaths sandbox, chmod on the
+            // writable overlay can return EROFS. The service must start;
+            // a non-700 dir is logged, not fatal.
             #[cfg(unix)]
             {
                 let mut perms = std::fs::metadata(dir)?.permissions();
                 std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
-                std::fs::set_permissions(dir, perms)?;
+                if let Err(e) = std::fs::set_permissions(dir, perms) {
+                    tracing::warn!(path = %dir.display(), error = %e, "could not set 700 on artifact dir");
+                }
             }
         }
     }
