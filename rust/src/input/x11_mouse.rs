@@ -120,9 +120,27 @@ pub fn check_in_window(rect: Option<&WindowRect>, x: i32, y: i32) -> Result<()> 
 /// BUG-1; it must never come back.
 ///
 /// Blocking X11 I/O: callers MUST wrap this in `spawn_blocking`.
+#[allow(dead_code)] // fallback path; the shared-connection `resolve_window_rect_on` is preferred
 pub fn resolve_window_rect(display: Option<&str>, chrome_pid: u32) -> Result<WindowRect> {
     let (conn, screen_num) =
         RustConnection::connect(display).context("connecting to X11 display")?;
+    resolve_window_rect_on(&conn, screen_num, chrome_pid).map(|(_, rect)| rect)
+}
+
+/// [`resolve_window_rect`] on an already-connected `RustConnection`.
+/// Used with the parked shared connection so a visible click does not
+/// pay the TCP+handshake cost on every call. The queries themselves
+/// (client list, PID match, geometry) are always FRESH — only the
+/// socket is reused, so a moved window can never pass the gate on stale
+/// data.
+///
+/// Returns the matched X11 window id alongside the rect so callers can
+/// memoize the id (not the rect) across clicks.
+pub fn resolve_window_rect_on(
+    conn: &RustConnection,
+    screen_num: usize,
+    chrome_pid: u32,
+) -> Result<(Window, WindowRect)> {
     let root = conn.setup().roots[screen_num].root;
     let client_list_atom = conn
         .intern_atom(false, b"_NET_CLIENT_LIST")
@@ -170,16 +188,110 @@ pub fn resolve_window_rect(display: Option<&str>, chrome_pid: u32) -> Result<Win
             .context("get_geometry")?
             .reply()
             .context("get_geometry reply")?;
-        return Ok(WindowRect {
-            x: i32::from(pos.dst_x),
-            y: i32::from(pos.dst_y),
-            w: u32::from(geo.width),
-            h: u32::from(geo.height),
-        });
+        return Ok((
+            win,
+            WindowRect {
+                x: i32::from(pos.dst_x),
+                y: i32::from(pos.dst_y),
+                w: u32::from(geo.width),
+                h: u32::from(geo.height),
+            },
+        ));
     }
     Err(anyhow!(
         "no X11 window with _NET_WM_PID={chrome_pid} on this display"
     ))
+}
+
+/// Re-query a KNOWN window's geometry fresh from X11 (no client-list
+/// walk). Used by the geometry cache fast path: the window id is
+/// memoized, but the rect is always re-read, so a moved window yields
+/// its CURRENT position — never a stale rect.
+pub fn refresh_window_rect(
+    conn: &RustConnection,
+    screen_num: usize,
+    win: Window,
+    chrome_pid: u32,
+) -> Result<WindowRect> {
+    use x11rb::protocol::xproto::AtomEnum;
+    let root = conn.setup().roots[screen_num].root;
+    // Fresh PID check on the memoized window: if the window was
+    // recreated (new id) or now belongs to another pid, fall back to
+    // the full walk instead of trusting the cached id.
+    let wm_pid_atom = conn
+        .intern_atom(false, b"_NET_WM_PID")
+        .context("intern _NET_WM_PID")?
+        .reply()
+        .context("intern _NET_WM_PID reply")?
+        .atom;
+    let prop = conn
+        .get_property(false, win, wm_pid_atom, AtomEnum::CARDINAL, 0, 1)
+        .context("read _NET_WM_PID")?
+        .reply()
+        .context("_NET_WM_PID reply")?;
+    if prop.format != 32 || prop.value.len() < 4 {
+        anyhow::bail!("cached window lost its _NET_WM_PID property");
+    }
+    let pid = u32::from_ne_bytes([prop.value[0], prop.value[1], prop.value[2], prop.value[3]]);
+    if pid != chrome_pid {
+        anyhow::bail!("cached window now belongs to pid {pid}, not Chrome ({chrome_pid})");
+    }
+    let pos = conn
+        .translate_coordinates(win, root, 0, 0)
+        .context("translate_coords")?
+        .reply()
+        .context("translate_coords reply")?;
+    let geo = conn
+        .get_geometry(win)
+        .context("get_geometry")?
+        .reply()
+        .context("get_geometry reply")?;
+    Ok(WindowRect {
+        x: i32::from(pos.dst_x),
+        y: i32::from(pos.dst_y),
+        w: u32::from(geo.width),
+        h: u32::from(geo.height),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Parked shared X11 connection.
+// ---------------------------------------------------------------------------
+
+/// Slot type for the parked connection: (display, connection, screen).
+/// Lives in `BridgeState.x11`; only touched inside `spawn_blocking`.
+pub type X11Slot = std::sync::Mutex<Option<(String, RustConnection, usize)>>;
+
+/// Take the parked X11 connection for `display`, connecting lazily on
+/// first use or when the display changed.
+///
+/// The caller MUST hand the connection back via [`park_x11_conn`] on the
+/// success path. On ANY error the connection is dropped (not parked) so
+/// the next call reconnects — a broken or desynced socket never serves
+/// a second click. Only the socket is reused; every resolve/click still
+/// issues fresh X11 queries, so the audit-42 ground-truth property is
+/// unchanged.
+pub fn take_x11_conn(slot: &X11Slot, display: &str) -> Result<(RustConnection, usize)> {
+    let mut guard = slot
+        .lock()
+        .map_err(|e| anyhow!("X11 connection slot poisoned: {e}"))?;
+    if let Some((d, conn, screen)) = guard.take() {
+        if d == display {
+            return Ok((conn, screen));
+        }
+        // Display changed: drop the stale connection and reconnect below.
+    }
+    let (conn, screen) =
+        RustConnection::connect(Some(display)).context("connecting to X11 display")?;
+    Ok((conn, screen))
+}
+
+/// Return a healthy connection to the park. Best-effort: a poisoned
+/// mutex just means the next call reconnects.
+pub fn park_x11_conn(slot: &X11Slot, display: &str, conn: RustConnection, screen: usize) {
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Some((display.to_string(), conn, screen));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -423,16 +535,29 @@ impl X11Mouse {
     /// $DISPLAY (manual runs); production callers pass the configured
     /// display so input injection can never diverge from the display the
     /// browser was spawned on (audit 41 LOW-6).
+    #[allow(dead_code)] // fallback; production path uses `from_conn` on the shared socket
     pub fn new(display: Option<&str>) -> Result<Self> {
         let (conn, screen_num) =
             RustConnection::connect(display).context("connecting to X11 display")?;
         let root = conn.setup().roots[screen_num].root;
-        Ok(Self {
+        Ok(Self::from_conn(conn, root))
+    }
+
+    /// Build on an already-connected socket (the parked shared
+    /// connection). The caller recovers the socket with
+    /// [`X11Mouse::into_conn`] when done.
+    pub fn from_conn(conn: RustConnection, root: Window) -> Self {
+        Self {
             conn: Mutex::new(conn),
             root,
             window_rect: None,
             rng_salt: AtomicU64::new(1),
-        })
+        }
+    }
+
+    /// Recover the owned connection (for returning to the park).
+    pub fn into_conn(self) -> RustConnection {
+        self.conn.into_inner().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Set the verified Chrome window rect (from fresh JS geometry).
