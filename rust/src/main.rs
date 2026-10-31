@@ -34,6 +34,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+#[allow(clippy::too_many_lines)] // main() is linear startup wiring: config -> dirs -> watchdog -> supervisor -> routes
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // JSON logging to stdout (journald picks it up)
@@ -54,26 +55,29 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::load()?;
     let state: SharedState = Arc::new(BridgeState::new(config.clone()));
 
-    // MCP stdio mode: skip HTTP server, serve MCP directly
-    if mcp_stdio {
-        tracing::info!("starting in MCP stdio mode");
-        return crate::mcp::serve_stdio(state).await;
-    }
-
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         bind = format!("{}:{}", config.bind_addr, config.bind_port),
         "vm-bridge starting"
     );
 
-    // Ensure artifact dirs exist with mode 700 (audit SEC-8)
-    for dir in [&config.failure_dir, &config.trace_dir] {
-        std::fs::create_dir_all(dir)?;
-        #[cfg(unix)]
-        {
-            let mut perms = std::fs::metadata(dir)?.permissions();
-            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
-            std::fs::set_permissions(dir, perms)?;
+    // Ensure artifact dirs exist with mode 700 (audit SEC-8).
+    // Upload staging dirs ride along here so the HTTP upload route and the
+    // MCP upload tool share one allowlist: config.upload_dirs (audit 41
+    // MED-6). The HTTP route used to hardcode ~/jobs/uploads while MCP
+    // read the config knob — a split-brain allowlist.
+    {
+        let mut dirs: Vec<&std::path::Path> =
+            vec![config.failure_dir.as_path(), config.trace_dir.as_path()];
+        dirs.extend(config.upload_dirs.iter().map(std::path::PathBuf::as_path));
+        for dir in dirs {
+            std::fs::create_dir_all(dir)?;
+            #[cfg(unix)]
+            {
+                let mut perms = std::fs::metadata(dir)?.permissions();
+                std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
+                std::fs::set_permissions(dir, perms)?;
+            }
         }
     }
 
@@ -94,6 +98,19 @@ async fn main() -> anyhow::Result<()> {
             Box::new(crate::browser::backend_chrome::ChromeBackend::new());
         crate::browser::supervise::run_supervisor(backend, sup_state).await;
     });
+
+    // MCP stdio mode: skip the HTTP server, serve MCP directly. The browser
+    // supervisor + watchdog above MUST already be running: every browser MCP
+    // tool delegates to the same route handlers as the HTTP API (audit 41
+    // HIGH-1 — the early return used to sit above the spawns, so in
+    // --mcp-stdio mode no browser ever launched and every browser tool
+    // hung 60s in ensure_browser then died).
+    if mcp_stdio {
+        tracing::info!("starting in MCP stdio mode");
+        // No HTTP listener in this mode; signal readiness directly (LOW-5).
+        crate::watchdog::sd_notify("READY=1");
+        return crate::mcp::serve_stdio(state).await;
+    }
 
     // Build router. Layer order (outermost first): rate_limit → auth → body_cap.
     // NO OpenAPI docs exposed (audit: docs stay disabled).
@@ -251,6 +268,10 @@ async fn main() -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.bind_addr, config.bind_port);
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!("listening on {}", addr);
+    // Readiness is "serving", not "process started": notify systemd only
+    // after the listener binds (audit 41 LOW-5). The watchdog keeps sending
+    // periodic WATCHDOG=1 pings from its loop.
+    crate::watchdog::sd_notify("READY=1");
 
     axum::serve(
         listener,
