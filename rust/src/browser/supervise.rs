@@ -9,9 +9,9 @@
 //! Health is split in two on purpose:
 //! - the supervisor watches the *process* (did the child exit?),
 //! - the watchdog watches the *CDP session* (does evaluate answer?).
-//! Either one marking the browser dead funnels into the same respawn path
-//! here. `metrics.relaunches` increments only on real recovery, never on
-//! boot.
+//!   Either one marking the browser dead funnels into the same respawn path
+//!   here. `metrics.relaunches` increments only on real recovery, never on
+//!   boot.
 
 use crate::browser::attach::spawn_handler;
 use crate::browser::backend::{BackendConfig, BrowserBackend};
