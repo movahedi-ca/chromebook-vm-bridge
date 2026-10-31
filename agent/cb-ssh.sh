@@ -2,9 +2,9 @@
 # cb-ssh.sh - hardened SSH wrapper for chromebook-vm.
 #
 # Target: $CB_HOST (e.g. auto@100.x.y.z on your tailnet).
-# The original deployment reaches the VM over a Tailscale tailnet via a
-# ProxyCommand helper (ts_proxy_cmd.py) that mints fresh proxy auth per call.
-# Adapt CB_PROXY_CMD below to your own network: direct SSH needs no proxy.
+# Direct SSH is the default (CB_PROXY_CMD empty). If your network needs a
+# proxy, set CB_PROXY_CMD to a helper script (the original deployment used
+# a ts_proxy_cmd.py that minted fresh proxy auth per call).
 #
 # Phase 2A connection hardening (2026-10-29, Worker A):
 #  1. Stale multiplex master auto-recovery: ssh -O check before every
@@ -83,7 +83,7 @@ CB_HOST="${CB_HOST:-}"
 CB_KEY="${CB_KEY:-$HOME/.ssh/id_ed25519}"
 CB_CM_DIR="${CB_CM_DIR:-$HOME/.ssh/cm}"
 CB_PINNED="${CB_PINNED_HOSTS:-$HOME/.ssh/known_hosts.d/chromebook-vm-pinned}"
-CB_PROXY_CMD="${CB_PROXY_CMD:-$HOME/chromebook-vm/ts_proxy_cmd.py}"  # environment-specific: supply your own, or empty for direct SSH
+CB_PROXY_CMD="${CB_PROXY_CMD:-}"  # empty = direct SSH; set to a proxy helper for proxied networks
 CB_AUDIT_LOG="${CB_AUDIT_LOG:-$HOME/chromebook-vm/conn-audit.log}"
 CB_CP="$CB_CM_DIR/cbv-%r@%h:%p"
 
@@ -206,8 +206,10 @@ fi
 
 : "${CB_HOST:?cb-ssh: CB_HOST is not set (e.g. export CB_HOST=\"auto@100.x.y.z\")}" 
 
-# Item 12: proxy helper pre-check, fail fast.
-[ -x "$CB_PROXY_CMD" ] || { audit_log "$E_PROXY_CMD" 0 0; die "$E_PROXY_CMD" "proxy helper missing or not executable: $CB_PROXY_CMD"; }
+# Item 12: proxy helper pre-check, fail fast (only when a proxy is configured).
+if [ -n "$CB_PROXY_CMD" ]; then
+  [ -x "$CB_PROXY_CMD" ] || { audit_log "$E_PROXY_CMD" 0 0; die "$E_PROXY_CMD" "proxy helper missing or not executable: $CB_PROXY_CMD"; }
+fi
 
 # Item 11: client key hygiene.
 [ -f "$CB_KEY" ] || { audit_log "$E_KEY" 0 0; die "$E_KEY" "client key missing: $CB_KEY"; }
@@ -227,8 +229,11 @@ SSH_BASE=(ssh -i "$CB_KEY"
   -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$CB_PINNED"
   -o ControlMaster=auto -o ControlPath="$CB_CP" -o ControlPersist=600
   -o ServerAliveInterval=30 -o ServerAliveCountMax=3
-  -o ConnectionAttempts=2
-  -o ProxyCommand="python3 $CB_PROXY_CMD %h %p")
+  -o ConnectionAttempts=2)
+# ProxyCommand only when a helper is configured (audit HIGH-3: empty means direct SSH).
+if [ -n "$CB_PROXY_CMD" ]; then
+  SSH_BASE+=(-o ProxyCommand="python3 $CB_PROXY_CMD %h %p")
+fi
 if [ -n "${CB_SSH_FLAGS:-}" ]; then
   # shellcheck disable=SC2206
   _extra=($CB_SSH_FLAGS)
