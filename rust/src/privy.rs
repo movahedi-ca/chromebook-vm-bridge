@@ -7,7 +7,8 @@
 //!
 //! Also provides the URL firewall for navigation (audit SEC-6).
 
-use regex::Regex;
+use regex::{Captures, Regex};
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 /// JS: remove deceptive nodes before serialization. Returns count removed.
@@ -79,15 +80,24 @@ fn patterns() -> &'static Vec<(Regex, &'static str)> {
 /// Wired into /browser/text, /browser/html, and eval string results
 /// (audit 42 High-5).
 pub fn redact(text: &str) -> (String, usize) {
-    let mut out = text.to_string();
-    let mut count = 0;
+    let mut count = 0usize;
+    // Borrowed until the first pattern actually matches: clean text costs
+    // no allocation.
+    let mut out: Cow<'_, str> = Cow::Borrowed(text);
     for (re, token) in patterns() {
-        // Count actual matches (audit LOW-5): the old length-diff heuristic
-        // undercounted multi-match patterns and missed same-length swaps.
-        count += re.find_iter(&out).count();
-        out = re.replace_all(&out, *token).into_owned();
+        // Single pass per pattern: count inside the replacer instead of a
+        // separate `find_iter` scan (the old code walked the string twice
+        // per pattern). `replace_all` returns `Borrowed` when nothing
+        // matched, in which case the Cow is left untouched.
+        let next = re.replace_all(&out, |_: &Captures| {
+            count += 1;
+            (*token).to_string()
+        });
+        if let Cow::Owned(s) = next {
+            out = Cow::Owned(s);
+        }
     }
-    (out, count)
+    (out.into_owned(), count)
 }
 
 /// URL firewall for navigation (audit SEC-6).
@@ -279,5 +289,22 @@ mod tests {
         let (out, n) = redact("my api_key = \"sk-1234567890abcdef\" end");
         assert!(n > 0);
         assert!(!out.contains("sk-1234567890abcdef"));
+    }
+
+    #[test]
+    fn redact_single_pass_counts_every_match() {
+        // Two secrets of the same class: the count must be exact (the
+        // single-pass replacer counts inside the closure, no find_iter).
+        let (out, n) = redact("a api_key=aaaaaaaaaaaaaaaa b api_key=bbbbbbbbbbbbbbbb c");
+        assert_eq!(n, 2);
+        assert!(!out.contains("aaaaaaaaaaaaaaaa"));
+        assert!(!out.contains("bbbbbbbbbbbbbbbb"));
+    }
+
+    #[test]
+    fn redact_clean_text_is_untouched() {
+        let (out, n) = redact("hello world, nothing secret here");
+        assert_eq!(n, 0);
+        assert_eq!(out, "hello world, nothing secret here");
     }
 }
