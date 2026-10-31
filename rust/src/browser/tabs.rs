@@ -9,9 +9,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-/// JS to install on every new document: FormGuard + diff observer.
+/// JS to install on every new document: `FormGuard` + diff observer.
 ///
-/// NOTE (audit HIGH-2): FormGuard is currently DISABLED. The receiving
+/// NOTE (audit HIGH-2): `FormGuard` is currently DISABLED. The receiving
 /// route (`/internal/checkpoint`) does not exist yet and the injected
 /// fetch would fire doomed requests (console noise + CSP risk) on every
 /// page. Re-enable by uncommenting below AND registering the internal
@@ -39,7 +39,7 @@ pub async fn wait_for_x11(dpy: &str) -> anyhow::Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    anyhow::bail!("X11 display {} not ready after 30s", dpy)
+    anyhow::bail!("X11 display {dpy} not ready after 30s")
 }
 
 /// Ensure the browser is running. The supervisor task owns the lifecycle
