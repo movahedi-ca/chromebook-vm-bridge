@@ -1,0 +1,32 @@
+[Unit]
+Description=VM Bridge: browser control API for the orchestrator
+After=network-online.target
+Wants=network-online.target
+# Restart storm guard
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+# Phase A (2026-10-30): Type=notify + WatchdogSec is the outer supervision
+# ring. The app sends READY=1 after the browser launches and WATCHDOG=1 on
+# every passing probe (never on a dead browser, so a wedged bridge gets
+# restarted by systemd, not just by the in-app watchdog).
+Type=notify
+WatchdogSec=30
+NotifyAccess=main
+# Headed browser needs the VNC display; show-mode rule: the user must see it.
+Environment=DISPLAY=:1
+# API key for the X-API-Key header (Phase A auth). File is mode 600,
+# deployed once, never overwritten by deploy-bridge.sh.
+EnvironmentFile=%h/.config/vm-bridge/env
+ExecStart=%h/jobs/vm-bridge/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8899 --loop uvloop --http httptools --limit-concurrency 8 --timeout-graceful-shutdown 20 --log-level warning
+WorkingDirectory=%h/jobs/vm-bridge
+# on-failure covers crashes and watchdog timeouts; 'always' would also
+# restart after an intentional stop, which is not what we want.
+Restart=on-failure
+RestartSec=5
+# Keep it lean on the small box
+MemoryMax=3G
+
+[Install]
+WantedBy=default.target
