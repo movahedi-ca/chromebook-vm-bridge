@@ -22,7 +22,7 @@
 ///
 /// This is the exact primitive from the optimization doc; it replaces the
 /// flaky keystroke-streaming that Workday silently discards.
-pub const FILL_REACT_JS: &str = r#"(el, val) => {
+pub const FILL_REACT_JS: &str = r"(el, val) => {
     const proto = el instanceof window.HTMLTextAreaElement
         ? window.HTMLTextAreaElement.prototype
         : window.HTMLInputElement.prototype;
@@ -32,7 +32,7 @@ pub const FILL_REACT_JS: &str = r#"(el, val) => {
     el.dispatchEvent(new Event('change', { bubbles: true }));
     el.dispatchEvent(new FocusEvent('blur', { bubbles: true }));
     return el.value;
-}"#;
+}";
 
 /// Segmented date-picker detector (Workday-style ARIA spinbuttons).
 ///
@@ -59,18 +59,18 @@ pub const FILL_DATE_JS: &str = r#"(container) => {
     return { kind: 'direct' };
 }"#;
 
-/// Atomic paste for operational-transformation editors (Overleaf ShareDB, etc.).
+/// Atomic paste for operational-transformation editors (Overleaf `ShareDB`, etc.).
 ///
 /// Dispatches a single synthetic `ClipboardEvent('paste')` carrying a
 /// `DataTransfer` payload on the target element, instead of streaming
 /// thousands of individual keystrokes. Takes `(el, text)` and returns `true`
-/// on dispatch. The 13 KB LaTeX paste that melted ShareDB in the Oct 30 field
+/// on dispatch. The 13 KB LaTeX paste that melted `ShareDB` in the Oct 30 field
 /// run becomes one event.
 ///
 /// Note: synthetic `ClipboardEvent` construction requires no clipboard
 /// permissions; the payload travels in page memory via `DataTransfer`.
 #[allow(dead_code)] // parked: atomic-paste endpoint is a 501 stub (audit MED-7)
-pub const PASTE_ATOMIC_JS: &str = r#"(el, text) => {
+pub const PASTE_ATOMIC_JS: &str = r"(el, text) => {
     el.focus();
     const dt = new DataTransfer();
     dt.setData('text/plain', text);
@@ -90,7 +90,7 @@ pub const PASTE_ATOMIC_JS: &str = r#"(el, text) => {
         }));
     }
     return true;
-}"#;
+}";
 
 /// Verify a fill/type by comparing the target element's value before/after.
 ///
@@ -110,7 +110,7 @@ pub fn type_verified_check(before: &str, after: &str) -> bool {
 /// `el.value` for form controls, `el.textContent` for contenteditable/others.
 #[allow(dead_code)] // parked: verified-type endpoint is a 501 stub (audit MED-7)
 pub const READ_TARGET_VALUE_JS: &str =
-    r#"(el) => (el.value !== undefined ? el.value : (el.textContent || ''))"#;
+    r"(el) => (el.value !== undefined ? el.value : (el.textContent || ''))";
 
 #[cfg(test)]
 mod tests {
