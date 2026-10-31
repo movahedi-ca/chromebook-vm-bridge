@@ -1,31 +1,40 @@
 [Unit]
 Description=vm-bridge 2.0 (Rust) — browser automation bridge
 Documentation=https://github.com/movahedi-ca/chromebook-vm-bridge
-After=graphical-session.target
-Wants=graphical-session.target
+After=vnc.service network-online.target
+Wants=vnc.service network-online.target
 
 [Service]
 Type=notify
 # NotifyAccess: we use sd_notify for READY=1 and WATCHDOG=1
 NotifyAccess=all
 # Watchdog: 60s. Our probe loop notifies every ~13s, well under.
-# (Fixes BUG-3: WatchdogSec=30 was killing us mid-probe.)
 WatchdogSec=60
 Restart=on-failure
 RestartSec=5
-# Cap restart storms (fixes StartLimitBurst=5 suicide)
+# Cap restart storms
 StartLimitIntervalSec=300
 StartLimitBurst=3
 
-# Environment: API keys via EnvironmentFile (mode 600), never in the unit
+# Environment: API keys via EnvironmentFile (mode 600), never in the unit.
+# BRIDGE_API_KEY in that file is accepted for all scopes (drop-in
+# replacement for existing clients). Set VM_BRIDGE_KEYS__READ/ACT/ADMIN
+# for real scope separation.
 EnvironmentFile=-%h/.config/vm-bridge/env
-# VM_BRIDGE_KEYS__READ, VM_BRIDGE_KEYS__ACT, VM_BRIDGE_KEYS__ADMIN
-# VM_BRIDGE_BIND_PORT=8900 (Rust dev instance; Python holds 8899)
+# Production: live port and the dedicated automation profile (sessions persist
+# here; seeded once from the chrome-main copy). The bridge spawns and
+# supervises its own Chrome child — no external browser required.
+Environment=VM_BRIDGE_BIND_PORT=8899
+Environment=VM_BRIDGE_PROFILE_DIR=%h/.config/chrome-automation
+Environment=DISPLAY=:1
+# Default log level: info so the supervisor's spawn/death/relaunch lines are
+# visible in the journal without needing RUST_LOG overrides.
+Environment=RUST_LOG=info
 
 ExecStart=%h/jobs/vm-bridge-rs/rust/target/release/vm-bridge
 WorkingDirectory=%h/jobs/vm-bridge-rs
 
-# Resource limits (replaces MemoryMax=3G guillotine)
+# Resource limits
 MemoryMax=4G
 MemoryHigh=3G
 
@@ -33,7 +42,7 @@ MemoryHigh=3G
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.config/vm-bridge %h/jobs/vm-bridge-rs %h/jobs/vm-bridge
+ReadWritePaths=%h/.config/vm-bridge %h/.config/chrome-automation %h/jobs/vm-bridge-rs %h/jobs/vm-bridge
 PrivateTmp=true
 
 # Logging
