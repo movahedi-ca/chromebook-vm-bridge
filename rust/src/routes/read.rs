@@ -15,7 +15,7 @@
 //! to 502/500 JSON `{"ok": false, "error": ...}`; slow CDP operations run
 //! under `tokio::time::timeout`.
 
-use crate::browser::actions::{active_page, eval_json};
+use crate::browser::actions::{active_page, close_page, eval_json};
 use crate::browser::geometry::GEOMETRY_JS;
 use crate::perception::{AxMapper, AX_SNAPSHOT_CAP};
 use crate::state::{SharedState, TabEntry};
@@ -158,16 +158,51 @@ pub async fn snapshot(State(state): State<SharedState>) -> impl IntoResponse {
         });
     })()"#;
 
-    let meta: Vec<(String, String)> =
-        match tokio::time::timeout(Duration::from_secs(15), eval_json(&page, WALKER_JS)).await {
-            Ok(Ok(v)) => serde_json::from_value(v).unwrap_or_default(),
-            _ => Vec::new(),
-        };
-    let elements =
-        match tokio::time::timeout(Duration::from_secs(15), page.find_elements(SELECTOR)).await {
-            Ok(Ok(els)) => els,
-            _ => Vec::new(),
-        };
+    // Two-call snapshot: (1) JS walker returns [role, name] pairs in document
+    // order; (2) find_elements returns Elements with backend_node_id in the
+    // same document order. Zipping gives us ref/role/name/backendNodeId.
+    // (CDP Accessibility.getFullAXTree is unreliable on attached browsers.)
+    //
+    // The two evaluations are NOT atomic: if the DOM mutates between them
+    // (re-render, lazy hydration), meta[i] and elements[i] describe different
+    // nodes and ref=N would bind to the wrong backendNodeId (audit 40 MED-5).
+    // Retry on length mismatch; fail loudly instead of silently min-ing.
+    let (meta, elements): (Vec<(String, String)>, Vec<chromiumoxide::Element>) = {
+        let mut attempt = 0;
+        loop {
+            let meta: Vec<(String, String)> =
+                match tokio::time::timeout(Duration::from_secs(15), eval_json(&page, WALKER_JS))
+                    .await
+                {
+                    Ok(Ok(v)) => serde_json::from_value(v).unwrap_or_default(),
+                    _ => Vec::new(),
+                };
+            let elements =
+                match tokio::time::timeout(Duration::from_secs(15), page.find_elements(SELECTOR))
+                    .await
+                {
+                    Ok(Ok(els)) => els,
+                    _ => Vec::new(),
+                };
+            attempt += 1;
+            if meta.len() == elements.len() || attempt >= 3 {
+                break (meta, elements);
+            }
+            tracing::warn!(
+                meta_len = meta.len(),
+                el_len = elements.len(),
+                attempt,
+                "snapshot DOM mutated between evaluations; retrying"
+            );
+        }
+    };
+    if meta.len() != elements.len() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ok": false, "error": "snapshot DOM unstable: ref metadata and node handles misaligned after 3 attempts"})),
+        )
+            .into_response();
+    }
 
     // Tab id for the per-tab ref mapper.
     let tab_id = {
@@ -181,8 +216,9 @@ pub async fn snapshot(State(state): State<SharedState>) -> impl IntoResponse {
         let mut mappers = state.ax_mappers.lock().await;
         let mapper = mappers.entry(tab_id).or_insert_with(AxMapper::new);
         mapper.clear();
-        let n = meta.len().min(elements.len()).min(AX_SNAPSHOT_CAP);
-        truncated = meta.len() > AX_SNAPSHOT_CAP || elements.len() > AX_SNAPSHOT_CAP;
+        // meta.len() == elements.len() is guaranteed by the retry guard above.
+        let n = meta.len().min(AX_SNAPSHOT_CAP);
+        truncated = meta.len() > AX_SNAPSHOT_CAP;
         for i in 0..n {
             let (role, name) = &meta[i];
             let backend_id = elements[i].backend_node_id.inner();
@@ -232,9 +268,12 @@ pub async fn screenshot_hash(State(state): State<SharedState>) -> impl IntoRespo
         Ok(p) => p,
         Err(e) => return bad_gateway(format!("screenshot: {}", e)),
     };
-    let hash = match dhash_png(&png) {
-        Ok(h) => h,
-        Err(e) => return internal_error(format!("hash: {}", e)),
+    // dhash decodes + resamples the full frame: blocking pool, not the
+    // async runtime (audit 40 MED-6).
+    let hash = match tokio::task::spawn_blocking(move || dhash_png(&png)).await {
+        Ok(Ok(h)) => h,
+        Ok(Err(e)) => return internal_error(format!("hash: {}", e)),
+        Err(e) => return internal_error(format!("hash task: {}", e)),
     };
     let (url, _) = page_url_title(&page).await;
     (
@@ -246,34 +285,37 @@ pub async fn screenshot_hash(State(state): State<SharedState>) -> impl IntoRespo
 
 /// GET /browser/state — what the bridge thinks is happening.
 ///
-/// Compares the current viewport hash against the tab's stored baseline,
-/// then stores the current hash as the new baseline (baseline is None on
-/// the first read, so the first call reports `hash_match: false`).
+/// Compares the current viewport hash against the tab's stored baseline.
+/// READ-ONLY by the verify.rs review gate (audit 40 MED-7): a GET whose name
+/// starts with "state" must never mutate the baseline. (The baseline is
+/// captured at tab creation / navigation settle, not here, so consecutive
+/// reads report real drift instead of forcing `hash_match: true`.)
 pub async fn state(State(state): State<SharedState>) -> impl IntoResponse {
     let page = match active_page(&state).await {
         Ok(p) => p,
         Err(e) => return bad_gateway(format!("no active page: {}", e)),
     };
     let (url, title) = page_url_title(&page).await;
-    let current_hash = match capture_png(&page).await.and_then(|png| dhash_png(&png)) {
-        Ok(h) => h,
-        Err(e) => return bad_gateway(format!("state hash: {}", e)),
+    let png = match capture_png(&page).await {
+        Ok(p) => p,
+        Err(e) => return bad_gateway(format!("state screenshot: {}", e)),
+    };
+    // dhash decodes + resamples the full frame: blocking pool, not the
+    // async runtime (audit 40 MED-6).
+    let current_hash = match tokio::task::spawn_blocking(move || dhash_png(&png)).await {
+        Ok(Ok(h)) => h,
+        Ok(Err(e)) => return bad_gateway(format!("state hash: {}", e)),
+        Err(e) => return bad_gateway(format!("state hash task: {}", e)),
     };
 
-    // Read the baseline and store the new one. TabEntry has no &mut
-    // accessor, so remove/mutate/re-insert (re-insert also re-arms active).
+    // Read-only compare against the stored baseline (None = not yet
+    // captured, so the first reads report `hash_match: false`).
     let hash_match = {
-        let mut tabs = state.tabs.write().await;
-        let active_id = tabs.active().map(|e| e.id.clone());
-        match active_id.and_then(|id| tabs.remove(&id)) {
-            Some(mut entry) => {
-                let matched = entry.baseline_hash == Some(current_hash);
-                entry.baseline_hash = Some(current_hash);
-                tabs.insert(entry);
-                matched
-            }
-            None => false,
-        }
+        let tabs = state.tabs.read().await;
+        tabs.active_ref()
+            .and_then(|e| e.baseline_hash)
+            .map(|b| b == current_hash)
+            .unwrap_or(false)
     };
 
     (
@@ -326,17 +368,31 @@ pub async fn tab_new(
         )
             .into_response();
     }
-    let page =
-        match tokio::time::timeout(Duration::from_secs(30), browser.new_page(req.url.as_str()))
-            .await
-        {
-            Ok(Ok(p)) => p,
-            Ok(Err(e)) => return bad_gateway(format!("new_page: {}", e)),
-            Err(_) => return bad_gateway("new_page timed out"),
-        };
+    // SSRF guard: same validation as /browser/navigate (audit 40 CRIT-1).
+    // Blocks file://, loopback, link-local, private and CGNAT ranges.
+    let validated_url = match crate::privy::validate_navigate_url(&req.url, &[]).await {
+        Ok(u) => u,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": e})),
+            )
+                .into_response()
+        }
+    };
+    let page = match tokio::time::timeout(
+        Duration::from_secs(30),
+        browser.new_page(validated_url.as_str()),
+    )
+    .await
+    {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => return bad_gateway(format!("new_page: {}", e)),
+        Err(_) => return bad_gateway("new_page timed out"),
+    };
     let (url, title) = page_url_title(&page).await;
     let id = uuid::Uuid::new_v4().to_string();
-    {
+    let evicted = {
         let mut tabs = state.tabs.write().await;
         tabs.insert(TabEntry {
             id: id.clone(),
@@ -344,7 +400,10 @@ pub async fn tab_new(
             baseline_hash: None,
             url: url.clone(),
             title: title.clone(),
-        });
+        })
+    };
+    for p in evicted {
+        close_page(&p).await;
     }
     (
         StatusCode::OK,
