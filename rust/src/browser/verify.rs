@@ -118,6 +118,7 @@ pub fn hamming(a: u64, b: u64) -> u32 {
 /// deserializes directly from the JS snippet's return object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)] // 4 bools mirror the JS check object 1:1 for serde; a packed repr would break the contract
 pub struct TargetCheck {
     /// Node is still connected to the document (not detached by a re-render).
     pub attached: bool,
@@ -132,14 +133,14 @@ pub struct TargetCheck {
 
 impl TargetCheck {
     /// All preconditions hold: safe to dispatch input.
-    pub fn ok(&self) -> bool {
+    pub fn ok(self) -> bool {
         self.attached && self.visible && self.enabled && self.hit_target
     }
 
     /// The element is fine but something is ON TOP of it (modal dialog,
     /// cookie banner, overlay). The caller should dismiss the overlay or
     /// surface it to the agent — not click through it.
-    pub fn blocked_by_overlay(&self) -> bool {
+    pub fn blocked_by_overlay(self) -> bool {
         self.attached && self.visible && self.enabled && !self.hit_target
     }
 }
@@ -160,7 +161,7 @@ impl TargetCheck {
 /// - `hitTarget` uses the element's own center; callers targeting a
 ///   sub-rectangle should pass explicit coordinates instead (not covered
 ///   here — the ref-based flow always targets element center).
-pub const TARGET_CHECK_JS: &str = r#"(el) => {
+pub const TARGET_CHECK_JS: &str = r"(el) => {
     if (!el || !el.isConnected) {
         return { attached: false, visible: false, enabled: false, hitTarget: false };
     }
@@ -181,7 +182,7 @@ pub const TARGET_CHECK_JS: &str = r#"(el) => {
         hitTarget = !!hit && (hit === el || el.contains(hit));
     }
     return { attached: true, visible, enabled, hitTarget };
-}"#;
+}";
 
 /// Default Hamming tolerance for the coarse full-screen smoke check.
 ///
@@ -193,6 +194,9 @@ pub const SMOKE_MAX_HAMMING: u32 = 3;
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::cast_possible_truncation)] // test gradients: f32 brightness -> u8 pixel; range is [0,255] by construction
+    #![allow(clippy::cast_precision_loss)] // u32 dims -> f32 for test gradient math; precision irrelevant
+    #![allow(clippy::cast_sign_loss)] // f32 brightness is non-negative by construction
     use super::*;
     use image::{GrayImage, ImageBuffer};
     use std::io::Cursor;
