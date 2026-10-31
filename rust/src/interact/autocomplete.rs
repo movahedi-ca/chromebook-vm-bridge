@@ -20,7 +20,7 @@
 //!
 //! ## Audit H9 — the two defects this fixes
 //!
-//! The Python implementation had two silent-corruption bugs:
+//! The legacy implementation had two silent-corruption bugs:
 //! 1. **Bidirectional substring**: `query in option or option in query` meant
 //!    typing "No" matched "North". Fixed: [`exact_match`] is case-insensitive
 //!    *exact* equality only.
@@ -93,8 +93,14 @@ mod tests {
     #[test]
     fn exact_match_finds_case_insensitive() {
         let opts = ["Data Protection", "Privacy Engineering", "North"];
-        assert_eq!(exact_match("privacy engineering", &opts), Some("Privacy Engineering"));
-        assert_eq!(exact_match("DATA PROTECTION", &opts), Some("Data Protection"));
+        assert_eq!(
+            exact_match("privacy engineering", &opts),
+            Some("Privacy Engineering")
+        );
+        assert_eq!(
+            exact_match("DATA PROTECTION", &opts),
+            Some("Data Protection")
+        );
         assert_eq!(exact_match("  north  ", &opts), Some("North"));
     }
 
@@ -127,7 +133,10 @@ mod tests {
     #[test]
     fn exact_match_trims_both_sides() {
         let opts = ["  Padded Option  "];
-        assert_eq!(exact_match("padded option", &opts), Some("  Padded Option  "));
+        assert_eq!(
+            exact_match("padded option", &opts),
+            Some("  Padded Option  ")
+        );
     }
 
     #[test]
