@@ -46,23 +46,26 @@ pub async fn navigate(
                 .into_response()
         }
     };
-    let page = {
+    let (page, evicted) = {
         let mut tabs = state.tabs.write().await;
         if let Some(active) = tabs.active() {
-            active.page.clone()
+            (
+                active.page.clone(),
+                Vec::<std::sync::Arc<chromiumoxide::Page>>::new(),
+            )
         } else {
             match browser.new_page(url.as_str()).await {
                 Ok(p) => {
                     let page = std::sync::Arc::new(p);
                     let id = uuid::Uuid::new_v4().to_string();
-                    tabs.insert(crate::state::TabEntry {
+                    let ev = tabs.insert(crate::state::TabEntry {
                         id: id.clone(),
                         page: page.clone(),
                         baseline_hash: None,
                         url: url.to_string(),
                         title: String::new(),
                     });
-                    page
+                    (page, ev)
                 }
                 Err(e) => {
                     return (
@@ -74,6 +77,9 @@ pub async fn navigate(
             }
         }
     };
+    for p in evicted {
+        crate::browser::actions::close_page(&p).await;
+    }
     let nav_result = tokio::time::timeout(Duration::from_secs(30), async {
         page.goto(url.as_str()).await
     })
