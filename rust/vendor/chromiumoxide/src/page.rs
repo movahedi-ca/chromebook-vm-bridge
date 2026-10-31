@@ -574,6 +574,17 @@ impl Page {
         self.inner.screenshot(params).await
     }
 
+    /// Take a screenshot and return the raw Base64 payload without
+    /// decoding it (local addition — see `PageInner::screenshot_base64`
+    /// in `handler/page.rs`). Callers decode in `spawn_blocking` to keep
+    /// CPU work off the async executor.
+    pub async fn screenshot_base64(
+        &self,
+        params: impl Into<ScreenshotParams>,
+    ) -> Result<String> {
+        self.inner.screenshot_base64(params).await
+    }
+
     /// Save a screenshot of the page
     ///
     /// # Example save a png file of a website
