@@ -9,7 +9,7 @@ pub mod pool;
 pub mod read;
 
 use crate::state::SharedState;
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{http::StatusCode, response::IntoResponse, Json};
 use serde_json::json;
 
 /// Standard "not yet implemented" response for stub handlers.
@@ -35,9 +35,4 @@ pub async fn require_browser(state: &SharedState) -> Result<(), axum::response::
         )
             .into_response())
     }
-}
-
-#[allow(unused)]
-pub async fn _state(_s: State<SharedState>) -> impl IntoResponse {
-    Json(json!({"ok": true}))
 }
