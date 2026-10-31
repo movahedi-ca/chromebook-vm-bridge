@@ -384,6 +384,20 @@ impl PageInner {
     }
 
     pub async fn screenshot(&self, params: impl Into<ScreenshotParams>) -> Result<Vec<u8>> {
+        let b64 = self.screenshot_base64(params).await?;
+        Ok(utils::base64::decode(&b64)?)
+    }
+
+    /// Capture a screenshot and return the raw Base64 payload WITHOUT
+    /// decoding it.
+    ///
+    /// Local addition (audit 42 follow-up): Base64-decoding a ~300KB
+    /// screenshot is CPU work that used to run on the caller's async
+    /// executor thread inside `screenshot()`. Callers that already hop
+    /// to `spawn_blocking` for pixel work (the bridge's capture paths)
+    /// use this and decode there, keeping the executor free. Behavior
+    /// of `screenshot()` itself is unchanged.
+    pub async fn screenshot_base64(&self, params: impl Into<ScreenshotParams>) -> Result<String> {
         self.activate().await?;
         let params = params.into();
         let full_page = params.full_page();
@@ -436,7 +450,7 @@ impl PageInner {
             self.execute(ClearDeviceMetricsOverrideParams {}).await?;
         }
 
-        Ok(utils::base64::decode(&res.data)?)
+        Ok(String::from(res.data))
     }
 }
 
