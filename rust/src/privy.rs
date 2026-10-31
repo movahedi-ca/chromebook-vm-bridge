@@ -1,4 +1,4 @@
-//! PrivyGate: outbound perception firewall (playbook §11.4).
+//! `PrivyGate`: outbound perception firewall (playbook §11.4).
 //!
 //! Two passes before any payload leaves the bridge:
 //! 1. DOM sanitization: strip invisible/deceptive nodes used for prompt
@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 
 /// JS: remove deceptive nodes before serialization. Returns count removed.
 #[allow(dead_code)] // parked: sanitizer for a future snapshot pipeline (audit LOW-1)
-pub const SANITIZE_JS: &str = r#"
+pub const SANITIZE_JS: &str = r"
 (function() {
   let removed = 0;
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
@@ -36,45 +36,48 @@ pub const SANITIZE_JS: &str = r#"
   for (const el of doomed) { el.remove(); removed++; }
   return removed;
 })();
-"#;
+";
 
 #[allow(dead_code)] // parked: PII redactor not yet wired into any route (audit LOW-1)
 static PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
 
 #[allow(dead_code)] // parked: PII redactor not yet wired into any route (audit LOW-1)
 fn patterns() -> &'static Vec<(Regex, &'static str)> {
+    // Static regexes: expect, not unwrap — a broken pattern is a
+    // programming bug and must fail loudly at first use, with a
+    // message (pre-emptive hardening: no bare unwrap in src).
     PATTERNS.get_or_init(|| {
         vec![
             // API keys / tokens (generic high-entropy)
             (
-                Regex::new(r#"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*['"]?([A-Za-z0-9_\-]{16,})['"]?"#).unwrap(),
+                Regex::new(r#"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*['"]?([A-Za-z0-9_\-]{16,})['"]?"#).expect("PII pattern: static regex"),
                 "<REDACTED_SECRET>",
             ),
             // Payment cards (13-19 digits, Luhn-ish)
             (
-                Regex::new(r"\b(?:\d[ -]?){13,19}\b").unwrap(),
+                Regex::new(r"\b(?:\d[ -]?){13,19}\b").expect("PII pattern: static regex"),
                 "<REDACTED_CARD>",
             ),
             // SSN / SIN patterns
             (
-                Regex::new(r"\b\d{3}[- ]\d{3}[- ]\d{3}\b").unwrap(),
+                Regex::new(r"\b\d{3}[- ]\d{3}[- ]\d{3}\b").expect("PII pattern: static regex"),
                 "<REDACTED_ID>",
             ),
             // Bearer tokens
             (
-                Regex::new(r"Bearer\s+[A-Za-z0-9_\-\.]{16,}").unwrap(),
+                Regex::new(r"Bearer\s+[A-Za-z0-9_\-\.]{16,}").expect("PII pattern: static regex"),
                 "Bearer <REDACTED_TOKEN>",
             ),
             // AWS-style keys
             (
-                Regex::new(r"AKIA[0-9A-Z]{16}").unwrap(),
+                Regex::new(r"AKIA[0-9A-Z]{16}").expect("PII pattern: static regex"),
                 "<REDACTED_AWS_KEY>",
             ),
         ]
     })
 }
 
-/// Redact PII/secrets from text. Returns (redacted_text, redaction_count).
+/// Redact PII/secrets from text. Returns (`redacted_text`, `redaction_count`).
 #[allow(dead_code)] // parked: PII redactor not yet wired into any route (audit LOW-1)
 pub fn redact(text: &str) -> (String, usize) {
     let mut out = text.to_string();
@@ -89,6 +92,25 @@ pub fn redact(text: &str) -> (String, usize) {
 }
 
 /// URL firewall for navigation (audit SEC-6).
+/// Validate a client-supplied navigation URL and map rejection to the
+/// standard 400 response. Shared by `/browser/navigate`, `/browser/tab/new`
+/// and `/pool/navigate` (pre-emptive dedup: three identical match blocks).
+#[allow(clippy::result_large_err)] // axum Response is large by design; not worth boxing
+pub async fn validated_url_or_400(raw: &str) -> Result<url::Url, axum::response::Response> {
+    use axum::{
+        http::StatusCode,
+        response::{IntoResponse, Json},
+    };
+    match validate_navigate_url(raw, &[]).await {
+        Ok(u) => Ok(u),
+        Err(e) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": e})),
+        )
+            .into_response()),
+    }
+}
+
 /// Allows only http/https; blocks loopback, link-local, private ranges,
 /// and cloud metadata IPs after DNS resolution unless allowlisted.
 ///
@@ -99,10 +121,10 @@ pub fn redact(text: &str) -> (String, usize) {
 /// Host-header rewrite, which breaks TLS SNI/virtual hosting; accepted
 /// as a documented residual risk for a single-operator bridge.
 pub async fn validate_navigate_url(raw: &str, allowlist: &[String]) -> Result<url::Url, String> {
-    let parsed = url::Url::parse(raw).map_err(|e| format!("invalid URL: {}", e))?;
+    let parsed = url::Url::parse(raw).map_err(|e| format!("invalid URL: {e}"))?;
     match parsed.scheme() {
         "http" | "https" => {}
-        s => return Err(format!("scheme '{}' not allowed (http/https only)", s)),
+        s => return Err(format!("scheme '{s}' not allowed (http/https only)")),
     }
     let host = parsed.host_str().unwrap_or("");
     // Explicit allowlist bypass
@@ -112,10 +134,7 @@ pub async fn validate_navigate_url(raw: &str, allowlist: &[String]) -> Result<ur
     // Block by literal IP
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         if is_blocked_ip(&ip) {
-            return Err(format!(
-                "IP {} is blocked (loopback/link-local/private)",
-                ip
-            ));
+            return Err(format!("IP {ip} is blocked (loopback/link-local/private)"));
         }
         return Ok(parsed);
     }
@@ -129,12 +148,12 @@ pub async fn validate_navigate_url(raw: &str, allowlist: &[String]) -> Result<ur
         Ok(ips) => {
             for ip in ips {
                 if is_blocked_ip(&ip) {
-                    return Err(format!("host {} resolves to blocked IP {}", host, ip));
+                    return Err(format!("host {host} resolves to blocked IP {ip}"));
                 }
             }
             Ok(parsed)
         }
-        Err(e) => Err(format!("DNS resolution failed for {}: {}", host, e)),
+        Err(e) => Err(format!("DNS resolution failed for {host}: {e}")),
     }
 }
 
@@ -157,7 +176,7 @@ fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
             || v4.is_unspecified() || v4.is_multicast()
             // 169.254.169.254 (cloud metadata) is link-local → blocked
             // 100.64.0.0/10 (CGNAT) — check manually
-            || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b11000000) == 0b01000000)
+            || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b11_000000) == 0b01_000000)
         }
         std::net::IpAddr::V6(v6) => {
             v6.is_loopback()
