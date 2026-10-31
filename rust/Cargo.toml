@@ -1,0 +1,83 @@
+[package]
+name = "vm-bridge"
+version = "2.0.0"
+edition = "2021"
+description = "Rust rewrite of chromebook-vm-bridge: FastAPI+Playwright browser bridge as a single static binary"
+license = "MIT"
+
+[[bin]]
+name = "vm-bridge"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP server + async runtime
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.4", features = ["full"] }
+tower-http = { version = "0.5", features = ["limit", "compression-gzip", "trace"] }
+
+# Browser automation via CDP (replaces Playwright)
+chromiumoxide = { version = "0.7", features = ["tokio-runtime"] }
+
+# X11 / XTest input (replaces python-xlib)
+x11rb = { version = "0.13", features = ["xinput", "xtest"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Image hashing / comparison (replaces PIL+numpy+scikit-image)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+img_hash = "3"
+
+# SQLite for FormGuard vault
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Config
+config = "0.14"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# HTTP client for pool fetches
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# Rate limiting (replaces hand-rolled token bucket)
+governor = "0.8"
+
+# Constant-time comparison (replaces hmac.compare_digest)
+subtle = "2"
+
+# URL validation / SSRF firewall
+url = "2"
+
+# Streaming gzip with caps
+async-compression = { version = "0.4", features = ["tokio", "gzip"] }
+
+# MCP server
+rmcp = { version = "0.1", features = ["server"] }
+schemars = "0.8"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Misc
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+indexmap = { version = "2", features = ["serde"] }
+dirs = "5"
+validator = { version = "0.18", features = ["derive"] }
+futures-util = "0.3"
+regex = "1"
+
+[dev-dependencies]
+axum-test = "15"
+tokio-test = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
