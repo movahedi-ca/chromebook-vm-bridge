@@ -1,4 +1,4 @@
-//! Chrome implementation of [`BrowserBackend`](super::backend::BrowserBackend).
+//! Chrome implementation of [`super::backend::BrowserBackend`].
 //!
 //! Spawns `google-chrome-stable` headed via `std::process::Command` and
 //! reuses the normal CDP connect path against the child's debug port.
@@ -55,7 +55,7 @@ impl ChromeBackend {
     }
 
     async fn port_answers(port: u16) -> bool {
-        let url = format!("http://127.0.0.1:{}/json/version", port);
+        let url = format!("http://127.0.0.1:{port}/json/version");
         match tokio::time::timeout(Duration::from_secs(2), reqwest::get(&url)).await {
             Ok(Ok(resp)) => resp.status().is_success(),
             _ => false,
@@ -70,28 +70,23 @@ impl ChromeBackend {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        anyhow::bail!(
-            "chrome debug port {} did not answer within {}s",
-            port,
-            PORT_WAIT_SECS
-        )
+        anyhow::bail!("chrome debug port {port} did not answer within {PORT_WAIT_SECS}s")
     }
 
     /// Reap a dead child (or take back a live one). Returns true when the
     /// child is currently running.
     fn poll_child(&mut self) -> bool {
         match self.child.take() {
-            Some(mut child) => match child.try_wait() {
-                Ok(None) => {
+            Some(mut child) => {
+                if let Ok(None) = child.try_wait() {
                     self.child = Some(child);
                     true
-                }
-                _ => {
+                } else {
                     // Exited (or wait failed): reap to avoid a zombie.
                     let _ = child.wait();
                     false
                 }
-            },
+            }
             None => false,
         }
     }
@@ -121,7 +116,7 @@ impl ChromeBackend {
     /// our exact --remote-debugging-port flag, instead of `pkill -f` on a
     /// regex that could match an unrelated process.
     async fn clear_stray_listener(&self, port: u16) {
-        let flag = format!("--remote-debugging-port={}", port);
+        let flag = format!("--remote-debugging-port={port}");
         let mut killed = 0;
         if let Ok(entries) = std::fs::read_dir("/proc") {
             for entry in entries.flatten() {
@@ -129,20 +124,16 @@ impl ChromeBackend {
                     Ok(p) => p,
                     Err(_) => continue,
                 };
-                let exe_ok = std::fs::read_link(format!("/proc/{}/exe", pid))
-                    .map(|p| {
-                        p.file_name()
-                            .map(|n| {
-                                let n = n.to_string_lossy();
-                                n.contains("chrome") || n.contains("chromium")
-                            })
-                            .unwrap_or(false)
+                let exe_ok = std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|p| {
+                    p.file_name().is_some_and(|n| {
+                        let n = n.to_string_lossy();
+                        n.contains("chrome") || n.contains("chromium")
                     })
-                    .unwrap_or(false);
+                });
                 if !exe_ok {
                     continue;
                 }
-                let cmdline = std::fs::read(format!("/proc/{}/cmdline", pid))
+                let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
                     .map(|b| String::from_utf8_lossy(&b).into_owned())
                     .unwrap_or_default();
                 if cmdline.split('\0').any(|a| a == flag) {
@@ -253,17 +244,17 @@ impl BrowserBackend for ChromeBackend {
         port: u16,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + 'a>> {
         Box::pin(async move {
-            let body = reqwest::get(format!("http://127.0.0.1:{}/json/version", port))
+            let body = reqwest::get(format!("http://127.0.0.1:{port}/json/version"))
                 .await
-                .map_err(|e| anyhow::anyhow!("debugging port {} unreachable: {}", port, e))?
+                .map_err(|e| anyhow::anyhow!("debugging port {port} unreachable: {e}"))?
                 .text()
                 .await
-                .map_err(|e| anyhow::anyhow!("reading /json/version: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("reading /json/version: {e}"))?;
             let v: serde_json::Value = serde_json::from_str(&body)
-                .map_err(|e| anyhow::anyhow!("parsing /json/version: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("parsing /json/version: {e}"))?;
             v.get("webSocketDebuggerUrl")
                 .and_then(|u| u.as_str())
-                .map(|s| s.to_string())
+                .map(std::string::ToString::to_string)
                 .ok_or_else(|| anyhow::anyhow!("no webSocketDebuggerUrl in /json/version"))
         })
     }
