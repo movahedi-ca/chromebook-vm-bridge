@@ -50,7 +50,7 @@ pub const AUTOCOMPLETE_JS: &str = r#"() => {
 /// Takes `(inputEl)`; clicks a safe neutral point (document body top-left
 /// corner, which Workday treats as "commit") and blurs the input so the
 /// selection chip finalizes instead of lingering as a pending token.
-pub const AUTOCOMPLETE_COMMIT_JS: &str = r#"(inputEl) => {
+pub const AUTOCOMPLETE_COMMIT_JS: &str = r"(inputEl) => {
     const x = 8, y = 8;
     const el = document.elementFromPoint(x, y) || document.body;
     for (const type of ['mousedown', 'mouseup', 'click']) {
@@ -60,7 +60,7 @@ pub const AUTOCOMPLETE_COMMIT_JS: &str = r#"(inputEl) => {
     }
     if (inputEl) inputEl.blur();
     return true;
-}"#;
+}";
 
 /// Case-insensitive EXACT match over option texts.
 ///
