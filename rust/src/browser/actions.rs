@@ -21,6 +21,13 @@ use chromiumoxide::Page;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Best-effort close of a page target held behind an `Arc`. `Page::close`
+/// takes ownership, so clone the inner page — the clone addresses the same
+/// CDP target, so the real target closes.
+pub async fn close_page(page: &Arc<Page>) {
+    let _ = page.as_ref().clone().close().await;
+}
+
 /// Get the active tab's page, adopting an existing browser target if the
 /// registry is empty (happens right after attaching to a live browser).
 /// Ensures the browser is connected first (attach-or-launch).
@@ -50,29 +57,40 @@ pub async fn active_page(state: &SharedState) -> anyhow::Result<Arc<Page>> {
             .ok()
             .and_then(|r| r.into_value::<String>().ok())
             .unwrap_or_default();
+        let evicted = {
+            let mut tabs = state.tabs.write().await;
+            let id = uuid::Uuid::new_v4().to_string();
+            let ev = tabs.insert(crate::state::TabEntry {
+                id: id.clone(),
+                page: page.clone(),
+                baseline_hash: None,
+                url,
+                title,
+            });
+            tracing::info!(tab_id = %id, "adopted existing browser target");
+            ev
+        };
+        for p in evicted {
+            close_page(&p).await;
+        }
+        return Ok(page);
+    }
+    // Last resort: open a blank page.
+    let page = Arc::new(browser.new_page("about:blank").await?);
+    let evicted = {
         let mut tabs = state.tabs.write().await;
         let id = uuid::Uuid::new_v4().to_string();
         tabs.insert(crate::state::TabEntry {
             id: id.clone(),
             page: page.clone(),
             baseline_hash: None,
-            url,
-            title,
-        });
-        tracing::info!(tab_id = %id, "adopted existing browser target");
-        return Ok(page);
+            url: "about:blank".to_string(),
+            title: String::new(),
+        })
+    };
+    for p in evicted {
+        close_page(&p).await;
     }
-    // Last resort: open a blank page.
-    let page = Arc::new(browser.new_page("about:blank").await?);
-    let mut tabs = state.tabs.write().await;
-    let id = uuid::Uuid::new_v4().to_string();
-    tabs.insert(crate::state::TabEntry {
-        id: id.clone(),
-        page: page.clone(),
-        baseline_hash: None,
-        url: "about:blank".to_string(),
-        title: String::new(),
-    });
     Ok(page)
 }
 
