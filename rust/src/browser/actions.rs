@@ -7,7 +7,7 @@
 //!   browser's first existing target when the registry is empty (attach
 //!   scenario), or opens about:blank as a last resort.
 //! - Real input goes through CDP Input.dispatchMouseEvent, not synthetic
-//!   JS .click(): JS clicks don't trigger real browser behavior for
+//!   JS .`click()`: JS clicks don't trigger real browser behavior for
 //!   many widgets (verified on jspaint: only real clicks change state).
 
 use crate::state::SharedState;
@@ -101,25 +101,26 @@ pub async fn eval_json(page: &Page, js: &str) -> anyhow::Result<serde_json::Valu
         .map_err(|_| anyhow::anyhow!("evaluate timeout"))??;
     let v: serde_json::Value = result
         .into_value()
-        .map_err(|e| anyhow::anyhow!("deserialize evaluate result: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("deserialize evaluate result: {e}"))?;
     Ok(v)
 }
 
 /// Center of the first element matching a CSS selector, in viewport coords.
 pub async fn element_center(page: &Page, selector: &str) -> anyhow::Result<(f64, f64)> {
     let js = format!(
-        r#"(() => {{
+        r"(() => {{
             const el = document.querySelector({sel});
             if (!el) return null;
             const r = el.getBoundingClientRect();
             return {{x: r.x + r.width / 2, y: r.y + r.height / 2,
                      w: r.width, h: r.height}};
-        }})()"#,
-        sel = serde_json::to_string(selector).unwrap()
+        }})()",
+        sel = serde_json::to_string(selector)
+            .map_err(|e| anyhow::anyhow!("selector literal: {e}"))?
     );
     let v = eval_json(page, &js).await?;
     if v.is_null() {
-        anyhow::bail!("no element matches selector: {}", selector);
+        anyhow::bail!("no element matches selector: {selector}");
     }
     let x = v["x"]
         .as_f64()
@@ -131,7 +132,7 @@ pub async fn element_center(page: &Page, selector: &str) -> anyhow::Result<(f64,
 }
 
 /// Center of a DOM node by backendNodeId, in viewport coords.
-/// Uses DOM.resolveNode + DOM.getBoxModel (the click_node wiring).
+/// Uses DOM.resolveNode + DOM.getBoxModel (the `click_node` wiring).
 pub async fn node_center(page: &Page, backend_node_id: i64) -> anyhow::Result<(f64, f64)> {
     let resolve = page
         .execute(
@@ -140,7 +141,7 @@ pub async fn node_center(page: &Page, backend_node_id: i64) -> anyhow::Result<(f
                 .build(),
         )
         .await
-        .map_err(|e| anyhow::anyhow!("DOM.resolveNode failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("DOM.resolveNode failed: {e}"))?;
     let object_id = resolve
         .result
         .object
@@ -149,32 +150,32 @@ pub async fn node_center(page: &Page, backend_node_id: i64) -> anyhow::Result<(f
     let box_model = page
         .execute(GetBoxModelParams::builder().object_id(object_id).build())
         .await
-        .map_err(|e| anyhow::anyhow!("DOM.getBoxModel failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("DOM.getBoxModel failed: {e}"))?;
     let model = box_model.result.model;
     // Content quad: [x1,y1, x2,y2, x3,y3, x4,y4]
     let q = model.content.inner();
     if q.len() < 8 {
         anyhow::bail!("getBoxModel: short content quad");
     }
-    let min_x = q.iter().step_by(2).cloned().fold(f64::INFINITY, f64::min);
+    let min_x = q.iter().step_by(2).copied().fold(f64::INFINITY, f64::min);
     let max_x = q
         .iter()
         .step_by(2)
-        .cloned()
+        .copied()
         .fold(f64::NEG_INFINITY, f64::max);
     let min_y = q
         .iter()
         .skip(1)
         .step_by(2)
-        .cloned()
+        .copied()
         .fold(f64::INFINITY, f64::min);
     let max_y = q
         .iter()
         .skip(1)
         .step_by(2)
-        .cloned()
+        .copied()
         .fold(f64::NEG_INFINITY, f64::max);
-    Ok(((min_x + max_x) / 2.0, (min_y + max_y) / 2.0))
+    Ok((f64::midpoint(min_x, max_x), f64::midpoint(min_y, max_y)))
 }
 
 /// Dispatch one CDP mouse event at viewport coordinates.
@@ -192,10 +193,10 @@ async fn mouse_event(
         .button(MouseButton::Left)
         .click_count(click_count)
         .build()
-        .map_err(|e: String| anyhow::anyhow!("mouse params: {}", e))?;
+        .map_err(|e: String| anyhow::anyhow!("mouse params: {e}"))?;
     page.execute(params)
         .await
-        .map_err(|e| anyhow::anyhow!("dispatchMouseEvent failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("dispatchMouseEvent failed: {e}"))?;
     Ok(())
 }
 
@@ -247,10 +248,10 @@ pub async fn insert_text(page: &Page, text: &str) -> anyhow::Result<()> {
     let params = InsertTextParams::builder()
         .text(text)
         .build()
-        .map_err(|e: String| anyhow::anyhow!("insertText params: {}", e))?;
+        .map_err(|e: String| anyhow::anyhow!("insertText params: {e}"))?;
     page.execute(params)
         .await
-        .map_err(|e| anyhow::anyhow!("Input.insertText failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Input.insertText failed: {e}"))?;
     Ok(())
 }
 
@@ -281,10 +282,10 @@ pub async fn press_key(page: &Page, key: &str) -> anyhow::Result<()> {
             .code(code)
             .windows_virtual_key_code(vk)
             .build()
-            .map_err(|e: String| anyhow::anyhow!("key params: {}", e))?;
+            .map_err(|e: String| anyhow::anyhow!("key params: {e}"))?;
         page.execute(params)
             .await
-            .map_err(|e| anyhow::anyhow!("dispatchKeyEvent failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("dispatchKeyEvent failed: {e}"))?;
     }
     Ok(())
 }
