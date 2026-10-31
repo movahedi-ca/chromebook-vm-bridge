@@ -19,7 +19,7 @@ tower-http = { version = "0.5", features = ["limit", "compression-gzip", "trace"
 # Browser automation via CDP (replaces Playwright)
 chromiumoxide = { version = "0.7", features = ["tokio-runtime"] }
 
-# X11 / XTest input (replaces python-xlib)
+# X11 / XTest input
 x11rb = { version = "0.13", features = ["xinput", "xtest"] }
 
 # Serialization
@@ -81,3 +81,11 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+# vm-bridge patch: vendor chromiumoxide 0.7.0 with a one-line resilience fix
+# in src/conn.rs — an unparseable WS message (CDP protocol drift, e.g. Chrome
+# 156s Network.requestWillBeSentExtraInfo) is skipped with a warning instead
+# of killing the entire CDP connection. Without this, any real network
+# activity eventually poisons the connection and the bridge goes deaf.
+[patch.crates-io]
+chromiumoxide = { path = "vendor/chromiumoxide" }
