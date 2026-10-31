@@ -872,10 +872,23 @@ pub async fn screenshot_compare(
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_GATEWAY, e.to_string()),
     };
-    let diff = match diff_images(&png, &reference, threshold) {
-        Ok(d) => d,
-        Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
+    // CPU-bound pixel work runs on the blocking pool, never the async
+    // runtime (audit 40 MED-6). Clone the frame: `png` is still needed
+    // below for the perceptual hash.
+    let png_for_diff = png.clone();
+    let diff = match tokio::task::spawn_blocking(move || {
+        diff_images(&png_for_diff, &reference, threshold)
+    })
+    .await
+    {
+        Ok(Ok(d)) => d,
+        Ok(Err(e)) => return err(StatusCode::BAD_REQUEST, e.to_string()),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("diff task: {e}")),
     };
+    // dhash decodes the frame too: blocking pool as well.
+    let hash = tokio::task::spawn_blocking(move || crate::browser::verify::dhash(&png))
+        .await
+        .unwrap_or(0);
     // A <1% changed-pixel budget absorbs caret blinks and antialiasing;
     // anything beyond that counts as a real visual change.
     let is_match = diff.score >= 0.99;
@@ -885,7 +898,7 @@ pub async fn screenshot_compare(
         "score": diff.score,
         "diff_pct": (1.0 - diff.score) * 100.0,
         "changed_pixels": diff.changed,
-        "hash": crate::browser::verify::dhash(&png),
+        "hash": hash,
     }))
 }
 
@@ -940,9 +953,18 @@ pub async fn screenshot_delta(
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_GATEWAY, e.to_string()),
     };
-    let diff = match diff_images(&png, &reference, threshold) {
-        Ok(d) => d,
-        Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
+    // CPU-bound pixel work runs on the blocking pool, never the async
+    // runtime (audit 40 MED-6). Clone the frame: `png` is still needed
+    // below for the patch crop.
+    let png_for_diff = png.clone();
+    let diff = match tokio::task::spawn_blocking(move || {
+        diff_images(&png_for_diff, &reference, threshold)
+    })
+    .await
+    {
+        Ok(Ok(d)) => d,
+        Ok(Err(e)) => return err(StatusCode::BAD_REQUEST, e.to_string()),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("diff task: {e}")),
     };
     let patch_b64 = match diff.bbox {
         None => String::new(),
