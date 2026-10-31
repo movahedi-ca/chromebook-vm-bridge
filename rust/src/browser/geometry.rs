@@ -1,13 +1,13 @@
 //! Window geometry: viewport (CSS px) <-> screen (X11 px) coordinate math.
 //!
-//! Audit BUG-1: the old Python bridge maintained FIVE conflicting geometry
-//! spaces (Playwright 1920x1040 viewport vs 1920x1080 window-size, a hardcoded
+//! Audit BUG-1: the legacy bridge maintained FIVE conflicting geometry
+//! spaces (the legacy driver 1920x1040 viewport vs 1920x1080 window-size, a hardcoded
 //! (20,22)/110px fallback, a (683,450) scroll center from a 1366x900 laptop,
 //! and CDP document quads fed straight into viewport-relative clicks).
 //!
 //! Worst of all, `bind_window`/`sync_window_geometry` overwrote a valid
 //! JS-derived offset cache with `root.translate_coords(win, 0, 0)`. In
-//! python-xlib, `src.translate_coords(dst, x, y)` translates coordinates
+//! Xlib, `src.translate_coords(dst, x, y)` translates coordinates
 //! *from the receiver* into the destination's space, so that call answered
 //! "where is the root origin inside the window's frame" (~(-win_x, -win_y)),
 //! not "where is the window on the screen". Every visible click then missed
@@ -24,10 +24,13 @@
 //! device-metric override, so **CSS pixels == physical X11 pixels** and
 //! `window.innerWidth/innerHeight` are already in screen pixels.
 //!
-//! If `window.deviceScaleFactor != 1` (HiDPI) or Playwright-style emulation
-//! is ever enabled, every coordinate here is wrong by that factor. The
-//! watchdog asserts `deviceScaleFactor == 1` at startup; if that assert
-//! ever fails, visible input must refuse to run rather than click blind.
+//! If `window.deviceScaleFactor != 1` (HiDPI) or the legacy driver-style emulation
+//! is ever enabled, every coordinate here is wrong by that factor. (An older
+//! revision of these docs claimed the watchdog asserted
+//! `deviceScaleFactor == 1` at startup; no such check exists — audit LOW-7.
+//! If HiDPI ever becomes a deployment reality, add the assert to the
+//! supervisor's connect step and refuse visible input when it fails,
+//! rather than clicking blind.)
 
 use serde::{Deserialize, Serialize};
 
@@ -138,7 +141,8 @@ pub fn clamp_to_viewport(x: i32, y: i32, geom: &WindowGeometry) -> (i32, i32) {
 /// the XTest pointer (screen coords via [`viewport_to_screen`]) and the CDP
 /// mouse to this point before dispatching the wheel event (audit H4: the old
 /// code moved only the XTest cursor while `page.mouse.wheel` fired at
-/// Playwright's unmoved virtual position).
+/// the legacy driver's unmoved virtual position).
+#[allow(dead_code)] // parked: scroll-center helper for a future visible-scroll path (audit LOW-1)
 pub fn scroll_center(geom: &WindowGeometry) -> (i32, i32) {
     (geom.inner_w / 2, geom.inner_h / 2)
 }
