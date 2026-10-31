@@ -46,6 +46,7 @@ pub const FILL_REACT_JS: &str = r#"(el, val) => {
 /// direct `FILL_REACT_JS` value set for plain text date inputs. This kills the
 /// "MM/DD/YYYY strings rejected" failure class without brittle calendar-grid
 /// clicking.
+#[allow(dead_code)] // parked: fill-date endpoint is a 501 stub (audit MED-7)
 pub const FILL_DATE_JS: &str = r#"(container) => {
     const root = container || document;
     const spins = Array.from(root.querySelectorAll('[role="spinbutton"]'));
@@ -68,6 +69,7 @@ pub const FILL_DATE_JS: &str = r#"(container) => {
 ///
 /// Note: synthetic `ClipboardEvent` construction requires no clipboard
 /// permissions; the payload travels in page memory via `DataTransfer`.
+#[allow(dead_code)] // parked: atomic-paste endpoint is a 501 stub (audit MED-7)
 pub const PASTE_ATOMIC_JS: &str = r#"(el, text) => {
     el.focus();
     const dt = new DataTransfer();
@@ -92,19 +94,21 @@ pub const PASTE_ATOMIC_JS: &str = r#"(el, text) => {
 
 /// Verify a fill/type by comparing the target element's value before/after.
 ///
-/// The old Python `type_verified` diffed `document.body.innerText.length`,
+/// The legacy `type_verified` diffed `document.body.innerText.length`,
 /// but `<input>`/`<textarea>` values are never reflected in `innerText` —
 /// the delta was always zero and successful fills falsely reported
 /// `text_not_found`. Compare the element's own value instead.
 ///
 /// `before` / `after` are the `el.value ?? el.textContent` readings taken by
 /// the route around the fill. Returns true when the value actually changed.
+#[allow(dead_code)] // parked: verified-type endpoint is a 501 stub (audit MED-7)
 pub fn type_verified_check(before: &str, after: &str) -> bool {
     before != after
 }
 
 /// JS snippet the route evaluates to read the verifiable value of a target:
 /// `el.value` for form controls, `el.textContent` for contenteditable/others.
+#[allow(dead_code)] // parked: verified-type endpoint is a 501 stub (audit MED-7)
 pub const READ_TARGET_VALUE_JS: &str =
     r#"(el) => (el.value !== undefined ? el.value : (el.textContent || ''))"#;
 
