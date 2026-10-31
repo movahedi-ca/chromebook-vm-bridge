@@ -1,11 +1,13 @@
-//! Pool route handlers: headless context pool (browser #2).
+//! Pool route handlers: isolated context pool on the main browser's pages
+//! (a separate headless browser was abandoned; see pool/mod.rs).
 //!
 //! Locking discipline: pool-state mutation happens under
 //! `state.pool.lock().await` and the lock is never held across slow CDP
-//! calls. Handlers clone the `Arc<Page>` out of the pool, drop the lock,
-//! then drive the page.
+//! calls. Handlers open pages BEFORE taking the lock and close evicted or
+//! released pages AFTER dropping it; only map bookkeeping (prune, LRU
+//! evict, insert) happens under the lock.
 
-use crate::browser::actions::{element_center, eval_json, insert_text, mouse_click};
+use crate::browser::actions::{close_page, element_center, eval_json, insert_text, mouse_click};
 use crate::state::SharedState;
 use axum::{
     extract::{Query, State},
@@ -127,11 +129,22 @@ pub async fn acquire(
             None => return err500("browser not connected"),
         }
     };
-    let mut pool = state.pool.lock().await;
-    match pool.acquire(&browser, req.ttl_s, req.trace).await {
-        Ok(id) => Json(json!({"ok": true, "context_id": id})).into_response(),
-        Err(e) => err500(e),
+    // Open the page BEFORE taking the pool lock: new_page is a slow CDP
+    // round-trip and the lock is never held across it (audit 40 MED-4).
+    let page = match browser.new_page("about:blank").await {
+        Ok(p) => Arc::new(p),
+        Err(e) => return err500(format!("pool new_page: {e}")),
+    };
+    let (id, to_close) = {
+        let mut pool = state.pool.lock().await;
+        let to_close = pool.prepare_acquire();
+        let id = pool.register(page, req.ttl_s, req.trace);
+        (id, to_close)
+    };
+    for p in to_close {
+        close_page(&p).await;
     }
+    Json(json!({"ok": true, "context_id": id})).into_response()
 }
 
 /// POST /pool/release {context_id} -> {"ok":true}
@@ -139,15 +152,21 @@ pub async fn release(
     State(state): State<SharedState>,
     Json(req): Json<ContextIdReq>,
 ) -> impl IntoResponse {
-    let mut pool = state.pool.lock().await;
-    if !pool.release(&req.context_id).await {
-        return (
+    let page = {
+        let mut pool = state.pool.lock().await;
+        pool.release(&req.context_id)
+    };
+    match page {
+        Some(p) => {
+            close_page(&p).await;
+            Json(json!({"ok": true})).into_response()
+        }
+        None => (
             StatusCode::NOT_FOUND,
             Json(json!({"ok": false, "error": format!("unknown context: {}", req.context_id)})),
         )
-            .into_response();
+            .into_response(),
     }
-    Json(json!({"ok": true})).into_response()
 }
 
 /// POST /pool/navigate {context_id, url, wait_until} -> {"ok":true,"url"}
@@ -159,7 +178,19 @@ pub async fn navigate(
         Ok(p) => p,
         Err(r) => return r,
     };
-    let nav = tokio::time::timeout(Duration::from_secs(30), page.goto(req.url.as_str())).await;
+    // SSRF guard: same validation as /browser/navigate (audit 40 HIGH-1).
+    let validated_url = match crate::privy::validate_navigate_url(&req.url, &[]).await {
+        Ok(u) => u,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": e})),
+            )
+                .into_response()
+        }
+    };
+    let nav =
+        tokio::time::timeout(Duration::from_secs(30), page.goto(validated_url.as_str())).await;
     match nav {
         Ok(Ok(_)) => match page.url().await {
             Ok(url) => Json(json!({"ok": true, "url": url.unwrap_or_default()})).into_response(),
@@ -438,13 +469,24 @@ pub async fn text(
 
 /// GET /pool/status -> {"ok":true,"contexts":N,"max":3,"browser":bool}
 pub async fn status(State(state): State<SharedState>) -> impl IntoResponse {
-    let mut pool = state.pool.lock().await;
-    pool.prune().await;
+    let (pruned, contexts, max, browser) = {
+        let mut pool = state.pool.lock().await;
+        let pruned = pool.prune();
+        (
+            pruned,
+            pool.context_count(),
+            pool.max_contexts(),
+            pool.is_browser_connected(),
+        )
+    };
+    for p in pruned {
+        close_page(&p).await;
+    }
     Json(json!({
         "ok": true,
-        "contexts": pool.context_count(),
-        "max": pool.max_contexts(),
-        "browser": pool.is_browser_connected(),
+        "contexts": contexts,
+        "max": max,
+        "browser": browser,
     }))
     .into_response()
 }
