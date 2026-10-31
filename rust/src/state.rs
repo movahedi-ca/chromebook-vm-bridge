@@ -209,9 +209,19 @@ pub struct BridgeState {
     pub rate_buckets: Mutex<RateBuckets>,
     /// Per-tab [ref=N] -> backendDOMNodeId mappers (perception plane)
     pub ax_mappers: Mutex<HashMap<String, AxMapper>>,
-    /// X11 connection: std Mutex, NEVER held across .await (it's blocking X11 I/O)
-    #[allow(dead_code)] // parked: shared X11 connection for future visible-input batching
-    pub x11: StdMutex<Option<x11rb::rust_connection::RustConnection>>,
+    /// Parked persistent X11 connection: (display, connection, screen).
+    /// A visible click takes it out, issues FRESH queries on the reused
+    /// socket, and parks it back on success; on error the socket is
+    /// dropped so the next click reconnects. Std Mutex, NEVER held
+    /// across .await (blocking X11 I/O — take/park inside spawn_blocking).
+    pub x11: StdMutex<Option<(String, x11rb::rust_connection::RustConnection, usize)>>,
+    /// Geometry fast-path memo: (window id, cached_at, (viewport_w, viewport_h) as i32).
+    /// Memoizes ONLY the window id — the rect is re-queried FRESH from X11
+    /// on every click via `refresh_window_rect`, so a moved window can
+    /// never pass the gate on a stale rect. TTL 3s; invalidated when the
+    /// page reports different viewport dimensions. Std Mutex, only
+    /// touched inside spawn_blocking.
+    pub geom_cache: StdMutex<GeomCache>,
     /// Shutdown flag for graceful teardown (audit BUG-4)
     pub shutting_down: std::sync::atomic::AtomicBool,
     /// OS pid of the supervised Chrome child, published by the supervisor
@@ -245,6 +255,12 @@ impl BridgeState {
         self.lease_gen.load(std::sync::atomic::Ordering::SeqCst) != gen0
     }
 
+    /// Click timing for the configured `interaction_profile` ("normal" =
+    /// historical 30/40 ms sleeps; "fast" = 5/10 ms).
+    pub fn click_timing(&self) -> crate::browser::actions::ClickTiming {
+        crate::browser::actions::ClickTiming::from_profile(&self.config.interaction_profile)
+    }
+
     pub fn new(config: Config) -> Self {
         Self {
             browser1: Mutex::new(Browser1::new()),
@@ -255,6 +271,7 @@ impl BridgeState {
             rate_buckets: Mutex::new(HashMap::new()),
             ax_mappers: Mutex::new(HashMap::new()),
             x11: StdMutex::new(None),
+            geom_cache: StdMutex::new(None),
             shutting_down: AtomicBool::new(false),
             chrome_pid: AtomicU32::new(0),
             lease_gen: AtomicU64::new(0),
@@ -267,3 +284,7 @@ impl BridgeState {
 }
 
 pub type SharedState = Arc<BridgeState>;
+
+/// Geometry fast-path memo: `Some((window_id, cached_at, (viewport_w, viewport_h)))`.
+/// Memoizes only the window id; the rect is always re-queried fresh.
+pub type GeomCache = Option<(u32, std::time::Instant, (i32, i32))>;
