@@ -74,10 +74,14 @@ pub struct ClickScreenReq {
     pub y: f64,
 }
 
+fn default_draw_speed() -> f64 {
+    1.0
+}
+
 #[derive(Deserialize)]
 pub struct DragReq {
     pub points: Vec<Vec<f64>>,
-    #[serde(default)]
+    #[serde(default = "default_draw_speed")]
     pub draw_speed: f64,
 }
 
@@ -415,7 +419,15 @@ pub async fn drag(State(state): State<SharedState>, Json(req): Json<DragReq>) ->
         }
         pts.push((p[0], p[1]));
     }
-    let _draw_speed = req.draw_speed;
+    // draw_speed is not implemented; fail fast rather than silently
+    // ignoring it (audit 40 LOW-8).
+    if (req.draw_speed - 1.0).abs() > f64::EPSILON {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"ok": false, "error": "draw_speed not implemented; use 1.0"})),
+        )
+            .into_response();
+    }
     let res: anyhow::Result<(StatusCode, Json<serde_json::Value>)> = async {
         let page = active_page(&state).await?;
         tokio::time::timeout(Duration::from_secs(120), mouse_drag(&page, &pts))
@@ -624,16 +636,19 @@ pub async fn press(
 /// POST /browser/wait — {selector, timeout_ms}. Polls every 250ms for the
 /// selector to appear; an empty selector just sleeps the timeout.
 pub async fn wait(State(state): State<SharedState>, Json(req): Json<WaitReq>) -> impl IntoResponse {
+    // Clamp: an unclamped timeout_ms lets a client park a worker (audit 40
+    // LOW-7). The 120s TimeoutLayer is the absolute backstop.
+    let timeout_ms = req.timeout_ms.clamp(250, 120_000);
     let res: anyhow::Result<(StatusCode, Json<serde_json::Value>)> = async {
         if req.selector.is_empty() {
-            tokio::time::sleep(Duration::from_millis(req.timeout_ms)).await;
+            tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
             return Ok((StatusCode::OK, Json(json!({"ok": true, "found": true}))));
         }
         let sel_lit = serde_json::to_string(&req.selector)
             .map_err(|e| anyhow::anyhow!("selector literal: {}", e))?;
         let js = format!("document.querySelector({sel}) !== null", sel = sel_lit);
         let page = active_page(&state).await?;
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(req.timeout_ms);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
         let found = loop {
             let v = eval_json(&page, &js).await?;
             if v.as_bool().unwrap_or(false) {
