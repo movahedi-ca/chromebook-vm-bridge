@@ -17,6 +17,7 @@ use chromiumoxide::cdp::browser_protocol::dom::{
 use chromiumoxide::cdp::browser_protocol::input::{
     DispatchMouseEventParams, DispatchMouseEventType, MouseButton,
 };
+use chromiumoxide::cdp::browser_protocol::network::SetBlockedUrLsParams;
 use chromiumoxide::Page;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +27,55 @@ use std::time::Duration;
 /// CDP target, so the real target closes.
 pub async fn close_page(page: &Arc<Page>) {
     let _ = page.as_ref().clone().close().await;
+}
+
+/// Literal-IP block patterns for `Network.setBlockedURLs` (audit 42
+/// High-1). CDP patterns match on URL strings (`*` wildcards), so they
+/// only catch literal IPs — hostnames that resolve to private IPs are
+/// still the job of `validate_navigate_url` + the post-goto re-check.
+/// Defense in depth: blocks literal-IP subresource loads, websocket
+/// upgrades, and redirect hops inside the renderer even if a check is
+/// ever bypassed.
+fn blocked_url_patterns() -> Vec<String> {
+    let mut pats = Vec::new();
+    // IPv4: whole-octet wildcards per scheme.
+    let mut v4: Vec<String> = vec![
+        "0".to_string(),               // 0.0.0.0/8
+        "10".to_string(),              // 10.0.0.0/8
+        "127".to_string(),             // loopback
+        "169.254".to_string(),         // link-local (cloud metadata)
+        "192.168".to_string(),         // 192.168.0.0/16
+        "255.255.255.255".to_string(), // broadcast
+    ];
+    for i in 16..=31 {
+        v4.push(format!("172.{i}")); // 172.16.0.0/12
+    }
+    for i in 64..=127 {
+        v4.push(format!("100.{i}")); // 100.64.0.0/10 CGNAT
+    }
+    for scheme in ["http", "https"] {
+        for net in &v4 {
+            pats.push(format!("{scheme}://{net}.*"));
+        }
+        // IPv6 literals (URL form [::1]): loopback, ULA, link-local.
+        // The wildcard sits inside the brackets; Chromium matches the
+        // pattern against the URL string.
+        for net in ["::1", "fc", "fd", "fe80"] {
+            pats.push(format!("{scheme}://[{net}*"));
+        }
+    }
+    pats
+}
+
+/// Install the literal-IP block patterns on a page's Network domain
+/// (audit 42 High-1). Called once per new target; idempotent.
+/// Best-effort: a failure is logged, never fatal — the Rust-side
+/// firewall remains the primary gate.
+pub async fn install_blocked_url_patterns(page: &Page) {
+    let params = SetBlockedUrLsParams::new(blocked_url_patterns());
+    if let Err(e) = page.execute(params).await {
+        tracing::warn!(error = %e, "setBlockedURLs failed (best-effort)");
+    }
 }
 
 /// Get the active tab's page, adopting an existing browser target if the
@@ -133,7 +183,14 @@ pub async fn element_center(page: &Page, selector: &str) -> anyhow::Result<(f64,
 
 /// Center of a DOM node by backendNodeId, in viewport coords.
 /// Uses DOM.resolveNode + DOM.getBoxModel (the `click_node` wiring).
-pub async fn node_center(page: &Page, backend_node_id: i64) -> anyhow::Result<(f64, f64)> {
+/// Content quad + center of the node with the given backendNodeId, in
+/// viewport coords. Read-only: `DOM.resolveNode` + `DOM.getBoxModel`, no
+/// input is ever dispatched (audit 42 High-7 — this is the primitive the
+/// AI-escalation tooling must use to locate a node, not `click_node`).
+///
+/// Returns `(center_x, center_y, quad)` where quad is the 8-number
+/// content quad `[x1,y1, x2,y2, x3,y3, x4,y4]`.
+pub async fn node_box(page: &Page, backend_node_id: i64) -> anyhow::Result<(f64, f64, Vec<f64>)> {
     let resolve = page
         .execute(
             ResolveNodeParams::builder()
@@ -175,7 +232,18 @@ pub async fn node_center(page: &Page, backend_node_id: i64) -> anyhow::Result<(f
         .step_by(2)
         .copied()
         .fold(f64::NEG_INFINITY, f64::max);
-    Ok((f64::midpoint(min_x, max_x), f64::midpoint(min_y, max_y)))
+    Ok((
+        f64::midpoint(min_x, max_x),
+        f64::midpoint(min_y, max_y),
+        q.clone(),
+    ))
+}
+
+/// Center of the node with the given backendNodeId, in viewport coords.
+/// Thin wrapper over [`node_box`]; the click itself is the caller's job.
+pub async fn node_center(page: &Page, backend_node_id: i64) -> anyhow::Result<(f64, f64)> {
+    let (x, y, _) = node_box(page, backend_node_id).await?;
+    Ok((x, y))
 }
 
 /// Dispatch one CDP mouse event at viewport coordinates.

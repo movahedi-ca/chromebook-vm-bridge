@@ -3,10 +3,14 @@
 //! Max 3 contexts (LRU, idle-expired by TTL). Guarded by the single
 //! `BridgeState::pool` mutex: acquire/release/lookup all serialize on it.
 //!
-//! The pool uses the main (headed) browser's pages for isolated contexts.
-//! A separate headless browser was attempted but chromiumoxide 0.7 has a
-//! WS deserialization bug with Chrome 156 that kills the handler on
-//! browser launch. Using the main browser provides identical API parity
+//! ISOLATION (audit 42 High-3): every pooled context gets its own
+//! DISPOSABLE browser context (`Target.createBrowserContext`), created on
+//! acquire and disposed on release/eviction. Pool pages never run in the
+//! default browser context, so they never see the signed-in profile's
+//! cookies, localStorage, or cache. A separate headless browser was
+//! attempted but chromiumoxide 0.7 has a WS deserialization bug with
+//! Chrome 156 that kills the handler on browser launch; disposable
+//! contexts on the main browser give the same cookie-jar isolation
 //! without a competing browser process.
 
 use std::collections::HashMap;
@@ -15,11 +19,16 @@ use std::time::{Duration, Instant};
 
 use chromiumoxide::Page;
 
-/// A single pooled context (isolated page on the main browser).
+/// A single pooled context: an isolated page in its own disposable
+/// browser context on the main browser.
 pub struct PoolContext {
     #[allow(dead_code)] // surfaced by /pool/status in a future revision
     pub id: String,
     pub page: Option<Arc<Page>>,
+    /// CDP `BrowserContextId` (as string) owning this page. Disposed on
+    /// release/eviction so no cookie jar, storage, or cache survives the
+    /// context (audit 42 High-3).
+    pub browser_context_id: Option<String>,
     pub last_used: Instant,
     pub ttl: Duration,
     #[allow(dead_code)] // surfaced by /pool/status in a future revision
@@ -53,21 +62,23 @@ impl PoolState {
         true
     }
 
-    /// Remove a context, returning its page. The caller MUST close the page
-    /// AFTER dropping the pool lock (audit 40 MED-3/MED-4: the lock is never
-    /// held across slow CDP calls). In-flight handlers hold their own clone;
+    /// Remove a context, returning its page and browser-context id. The
+    /// caller MUST close the page and dispose the browser context AFTER
+    /// dropping the pool lock (audit 40 MED-3/MED-4: the lock is never held
+    /// across slow CDP calls). In-flight handlers hold their own clone;
     /// in that case the target stays open until the browser dies, which is
     /// bounded by the pool cap. Returns None for an unknown id (live
     /// contexts always have a page, so None is unambiguous).
-    fn evict(&mut self, id: &str) -> Option<Arc<Page>> {
+    fn evict(&mut self, id: &str) -> Option<(Arc<Page>, Option<String>)> {
         let ctx = self.contexts.remove(id)?;
         tracing::debug!(context_id = %id, "pool context evicted");
-        ctx.page
+        Some((ctx.page?, ctx.browser_context_id))
     }
 
-    /// Prune TTL-expired contexts. No CDP calls; returns pages for the
-    /// caller to close after dropping the lock.
-    pub fn prune(&mut self) -> Vec<Arc<Page>> {
+    /// Prune TTL-expired contexts. No CDP calls; returns (page,
+    /// browser-context id) pairs for the caller to close/dispose after
+    /// dropping the lock.
+    pub fn prune(&mut self) -> Vec<(Arc<Page>, Option<String>)> {
         let now = Instant::now();
         let expired: Vec<String> = self
             .contexts
@@ -85,9 +96,10 @@ impl PoolState {
     }
 
     /// Bookkeeping half of acquire: prune expired, LRU-evict past the cap.
-    /// No CDP calls. Returns pages the caller must close after dropping the
-    /// lock. Call BEFORE opening the new page (audit 40 MED-4).
-    pub fn prepare_acquire(&mut self) -> Vec<Arc<Page>> {
+    /// No CDP calls. Returns (page, browser-context id) pairs the caller
+    /// must close/dispose after dropping the lock. Call BEFORE opening the
+    /// new page (audit 40 MED-4).
+    pub fn prepare_acquire(&mut self) -> Vec<(Arc<Page>, Option<String>)> {
         let mut to_close = self.prune();
         while self.contexts.len() >= self.max_contexts {
             let oldest = self
@@ -107,13 +119,20 @@ impl PoolState {
         to_close
     }
 
-    /// Register an already-opened page. No CDP calls. Returns the context id.
+    /// Register an already-opened page in its disposable browser context.
+    /// No CDP calls. Returns the context id.
     ///
     /// Note: check-then-insert is no longer atomic with page creation (the
     /// old atomicity required holding the lock across `new_page`, which
     /// MED-4 forbids), so two concurrent acquires may transiently exceed the
     /// cap by one; the next `prepare_acquire` corrects it.
-    pub fn register(&mut self, page: Arc<Page>, ttl_s: u64, trace: bool) -> String {
+    pub fn register(
+        &mut self,
+        page: Arc<Page>,
+        browser_context_id: String,
+        ttl_s: u64,
+        trace: bool,
+    ) -> String {
         let id: String = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         let ttl = Duration::from_secs(ttl_s.clamp(60, 3600));
         self.contexts.insert(
@@ -121,6 +140,7 @@ impl PoolState {
             PoolContext {
                 id: id.clone(),
                 page: Some(page),
+                browser_context_id: Some(browser_context_id),
                 last_used: Instant::now(),
                 ttl,
                 trace,
@@ -130,10 +150,11 @@ impl PoolState {
         id
     }
 
-    /// Release a context, returning its page for the caller to close after
-    /// dropping the lock. Returns None for an unknown id. (Live contexts
-    /// always have a page, so a None return is unambiguous here.)
-    pub fn release(&mut self, id: &str) -> Option<Arc<Page>> {
+    /// Release a context, returning its page and browser-context id for
+    /// the caller to close/dispose after dropping the lock. Returns None
+    /// for an unknown id. (Live contexts always have a page, so a None
+    /// return is unambiguous here.)
+    pub fn release(&mut self, id: &str) -> Option<(Arc<Page>, Option<String>)> {
         if !self.contexts.contains_key(id) {
             return None;
         }

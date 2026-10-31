@@ -8,7 +8,11 @@ use serde_json::json;
 
 #[derive(Debug, Deserialize)]
 pub struct AcquireRequest {
-    #[serde(default = "default_client")]
+    // `client_id` accepted as an alias: the agent CLI historically sent
+    // `client_id` while the server expected `client` (audit 42 Medium) —
+    // the mismatch silently fell back to "unknown". Both spellings work
+    // now; `client` is canonical.
+    #[serde(default = "default_client", alias = "client_id")]
     pub client: String,
     #[serde(default = "default_ttl")]
     pub ttl_s: i64,
@@ -30,18 +34,40 @@ pub struct LeaseIdRequest {
 }
 
 /// POST /lease/acquire — returns (`lease_id`, `clamped_ttl_s`).
-/// 423 if another client holds the lock.
+/// 423 if another client holds the lock, or if any browser mutation is
+/// currently in flight (audit 42 High-4: a new lease must never be granted
+/// over someone's mid-flight mutation — the in-flight handler was admitted
+/// under the old lease regime).
 pub async fn acquire(
     State(state): State<SharedState>,
     Json(req): Json<AcquireRequest>,
 ) -> impl IntoResponse {
+    if state
+        .inflight_mutations
+        .load(std::sync::atomic::Ordering::SeqCst)
+        > 0
+    {
+        state.metrics.lock().await.rejections_423 += 1;
+        return (
+            StatusCode::LOCKED,
+            Json(json!({"ok": false, "error": "mutations_in_flight: retry when no mutation is running"})),
+        )
+            .into_response();
+    }
     let mut leases = state.leases.lock().await;
     match leases.acquire(req.client, req.ttl_s) {
-        Ok((id, ttl)) => (
-            StatusCode::OK,
-            Json(json!({"ok": true, "lease_id": id, "ttl_s": ttl})),
-        )
-            .into_response(),
+        Ok((id, ttl)) => {
+            // Bump the lease generation: long handlers admitted earlier
+            // see the change and abort before irreversible steps.
+            state
+                .lease_gen
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (
+                StatusCode::OK,
+                Json(json!({"ok": true, "lease_id": id, "ttl_s": ttl})),
+            )
+                .into_response()
+        }
         Err(LeaseError::Locked { holder, ttl_left_s }) => {
             state.metrics.lock().await.rejections_423 += 1;
             // Holder is untrusted client input: log it server-side, never
@@ -93,6 +119,12 @@ pub async fn release(
 ) -> impl IntoResponse {
     let mut leases = state.leases.lock().await;
     if leases.release(&req.lease_id) {
+        // Bump the generation so in-flight mutations admitted under the
+        // old lease abort before their irreversible steps (audit 42
+        // High-4).
+        state
+            .lease_gen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         (StatusCode::OK, Json(json!({"ok": true}))).into_response()
     } else {
         (

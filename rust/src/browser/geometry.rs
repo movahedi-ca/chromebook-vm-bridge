@@ -14,8 +14,21 @@
 //! whenever Chrome was not at (0,0).
 //!
 //! The Xlib `translate_coords` path is DELETED here and must never come back.
-//! Screen coordinates are computed ONLY from a fresh [`GEOMETRY_JS`]
-//! evaluation immediately before each visible (`XTest`) action.
+//!
+//! ## Audit 42 Critical-1: page JS is not ground truth
+//!
+//! `window.screenX/screenY/outerWidth/outerHeight` are evaluated in the
+//! page, and a hostile page can return ANY values. They are used ONLY for
+//! the agreement check in the visible-input path (the page's story about
+//! the window origin must match X11 within a small tolerance, or the
+//! action is refused). The SEC-1 gate rect and the viewport origin come
+//! EXCLUSIVELY from [`crate::input::x11_mouse::resolve_window_rect`]:
+//! `_NET_CLIENT_LIST` + `_NET_WM_PID` matched against the supervised
+//! child pid, translated to root coordinates by the window manager.
+//!
+//! `window.innerWidth/innerHeight` are CSS math only: they size the
+//! viewport inside the X11-derived rect and cannot move it. `devicePixelRatio`
+//! must be 1 — visible input is refused outright on `HiDPI`.
 //!
 //! ## The `no_viewport` 1:1 assumption
 //!
@@ -24,49 +37,69 @@
 //! device-metric override, so **CSS pixels == physical X11 pixels** and
 //! `window.innerWidth/innerHeight` are already in screen pixels.
 //!
-//! If `window.deviceScaleFactor != 1` (`HiDPI`) or the legacy driver-style emulation
-//! is ever enabled, every coordinate here is wrong by that factor. (An older
-//! revision of these docs claimed the watchdog asserted
-//! `deviceScaleFactor == 1` at startup; no such check exists — audit LOW-7.
-//! If `HiDPI` ever becomes a deployment reality, add the assert to the
-//! supervisor's connect step and refuse visible input when it fails,
-//! rather than clicking blind.)
+//! If `window.devicePixelRatio != 1` (`HiDPI`) or the legacy driver-style emulation
+//! is ever enabled, every coordinate here is wrong by that factor. Visible
+//! input refuses to run in that case (fail closed); if `HiDPI` ever becomes
+//! a deployment reality, the supervisor must assert `devicePixelRatio == 1`
+//! at connect time instead.
 
 use serde::{Deserialize, Serialize};
 
 /// Window geometry snapshot, populated by evaluating [`GEOMETRY_JS`] in the
 /// page and deserializing the returned object.
 ///
+/// TRUST MODEL (audit 42 Critical-1): every field here comes from page JS
+/// and is therefore attacker-influenced. `screen_x/screen_y/outer_w/outer_h`
+/// are used ONLY for the X11 agreement check in the visible-input path —
+/// never for the SEC-1 gate rect or the viewport origin, which come from
+/// X11 ground truth. `inner_w/inner_h` are CSS math only (they size the
+/// viewport inside the X11 rect and cannot move it).
+///
 /// Field renames match the exact JS property names (`screenX`, `outerWidth`,
 /// …). Note: `#[serde(rename_all = "camelCase")]` would produce `outerW`,
 /// not `outerWidth` — hence the explicit renames.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct WindowGeometry {
-    /// `window.screenX`: window's left edge in screen pixels.
+    /// `window.screenX`: the page's CLAIM about the window's left edge.
+    /// Agreement-check only — never trusted for input coordinates.
     #[serde(rename = "screenX")]
     pub screen_x: i32,
-    /// `window.screenY`: window's top edge in screen pixels.
+    /// `window.screenY`: the page's CLAIM about the window's top edge.
+    /// Agreement-check only.
     #[serde(rename = "screenY")]
     pub screen_y: i32,
-    /// `window.outerWidth`: full window width incl. chrome borders.
+    /// `window.outerWidth`: the page's CLAIM about the full window width.
+    /// Agreement-check only.
     #[serde(rename = "outerWidth")]
     pub outer_w: i32,
-    /// `window.outerHeight`: full window height incl. title bar.
+    /// `window.outerHeight`: the page's CLAIM about the full window height.
+    /// Agreement-check only.
     #[serde(rename = "outerHeight")]
     pub outer_h: i32,
-    /// `window.innerWidth`: viewport width in CSS px (= screen px, see above).
+    /// `window.innerWidth`: viewport width in CSS px (= screen px when
+    /// `device_pixel_ratio == 1`). CSS math only.
     #[serde(rename = "innerWidth")]
     pub inner_w: i32,
-    /// `window.innerHeight`: viewport height in CSS px (= screen px).
+    /// `window.innerHeight`: viewport height in CSS px. CSS math only.
     #[serde(rename = "innerHeight")]
     pub inner_h: i32,
+    /// `window.devicePixelRatio`: must be 1 for visible input; the
+    /// visible-input path refuses to run otherwise (audit 42 Critical-1).
+    #[serde(rename = "devicePixelRatio")]
+    pub device_pixel_ratio: f64,
 }
 
 /// JS evaluated in the page immediately before any visible action.
 ///
 /// Returns `{screenX, screenY, outerWidth, outerHeight, innerWidth,
-/// innerHeight}`. The caller deserializes the result into [`WindowGeometry`]
-/// (field names match via `rename_all = "camelCase"`).
+/// innerHeight, devicePixelRatio}`. The caller deserializes the result into
+/// [`WindowGeometry`] (field names match via explicit renames).
+///
+/// TRUST (audit 42 Critical-1): this runs IN THE PAGE, so every value is
+/// attacker-influenced. The visible-input path uses `screenX/screenY` only
+/// for the X11 agreement check, `innerWidth/innerHeight` for CSS math, and
+/// `devicePixelRatio` for the `HiDPI` refusal. The gate rect and viewport
+/// origin always come from X11 (`resolve_window_rect`).
 ///
 /// Evaluate fresh every time — never cache across navigations, resizes, or
 /// tab switches. A stale cache is exactly what BUG-1 was.
@@ -77,6 +110,7 @@ pub const GEOMETRY_JS: &str = r"(() => ({
     outerHeight: window.outerHeight,
     innerWidth: window.innerWidth,
     innerHeight: window.innerHeight,
+    devicePixelRatio: window.devicePixelRatio,
 }))()";
 
 impl WindowGeometry {
@@ -161,6 +195,7 @@ mod tests {
             outer_h: 1080,
             inner_w: 1920,
             inner_h: 1040,
+            device_pixel_ratio: 1.0,
         }
     }
 
@@ -190,6 +225,7 @@ mod tests {
             outer_h: 1080,
             inner_w: 1900,
             inner_h: 1000,
+            device_pixel_ratio: 1.0,
         };
         assert_eq!(g.origin_x(), 110); // 100 + (1920-1900)/2
         assert_eq!(g.origin_y(), 130); // 50 + (1080-1000)
@@ -206,6 +242,7 @@ mod tests {
             outer_h: 1080,
             inner_w: 1920,
             inner_h: 1040,
+            device_pixel_ratio: 1.0,
         };
         let (x, y) = viewport_to_screen(i32::MAX, i32::MAX, &g);
         assert_eq!((x, y), (i32::MAX, i32::MAX)); // saturates, does not wrap
@@ -242,6 +279,7 @@ mod tests {
             outer_h: 900,
             inner_w: 1366,
             inner_h: 860,
+            device_pixel_ratio: 1.0,
         };
         assert_eq!(scroll_center(&small), (683, 430));
     }
@@ -258,6 +296,7 @@ mod tests {
             "outerHeight",
             "innerWidth",
             "innerHeight",
+            "devicePixelRatio",
         ] {
             assert!(GEOMETRY_JS.contains(key), "missing {key}");
         }
@@ -270,9 +309,11 @@ mod tests {
             "screenX": 100, "screenY": 50,
             "outerWidth": 1920, "outerHeight": 1080,
             "innerWidth": 1900, "innerHeight": 1000,
+            "devicePixelRatio": 1.0,
         });
         let g: WindowGeometry = serde_json::from_value(json).unwrap();
         assert_eq!(g.screen_x, 100);
         assert_eq!(g.inner_h, 1000);
+        assert!((g.device_pixel_ratio - 1.0).abs() < 1e-9);
     }
 }

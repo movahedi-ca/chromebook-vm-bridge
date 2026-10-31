@@ -14,6 +14,7 @@ use crate::perception::AxMapper;
 use crate::pool::PoolState;
 use indexmap::IndexMap;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
@@ -122,6 +123,21 @@ impl TabRegistry {
         }
     }
 
+    /// Write the LANDED url/title back into a tab entry (audit 42
+    /// Medium-4). `/browser/tabs` must show where the tab actually is,
+    /// not the URL that was requested before redirects. Returns false
+    /// when the tab id is unknown (evicted mid-flight).
+    pub fn set_url_title(&mut self, id: &str, url: &str, title: &str) -> bool {
+        match self.tabs.get_mut(id) {
+            Some(e) => {
+                e.url = url.to_string();
+                e.title = title.to_string();
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn list(&self) -> Vec<TabSummary> {
         self.tabs
             .iter()
@@ -198,6 +214,20 @@ pub struct BridgeState {
     pub x11: StdMutex<Option<x11rb::rust_connection::RustConnection>>,
     /// Shutdown flag for graceful teardown (audit BUG-4)
     pub shutting_down: std::sync::atomic::AtomicBool,
+    /// OS pid of the supervised Chrome child, published by the supervisor
+    /// after every successful bring-up (0 = unknown / no child). The
+    /// visible-input path matches it against `_NET_WM_PID` on X11 so the
+    /// SEC-1 gate rect comes from the window manager, never from page JS
+    /// (audit 42 Critical-1).
+    pub chrome_pid: AtomicU32,
+    /// Lease generation counter (audit 42 High-4): bumped on every lease
+    /// acquire and release. Long mutation handlers capture it at admission
+    /// and abort before any irreversible step when it changed mid-flight.
+    pub lease_gen: AtomicU64,
+    /// Mutating HTTP requests currently inside their handler (audit 42
+    /// High-4). `/lease/acquire` is rejected while this is non-zero so a
+    /// new lease can never be granted over someone's in-flight mutation.
+    pub inflight_mutations: AtomicU64,
     /// Process start time, for honest /health uptime reporting (audit 41
     /// MED-2 — `uptime_s` used to report wall-clock epoch seconds).
     pub started_at: std::time::Instant,
@@ -207,6 +237,14 @@ pub struct BridgeState {
 }
 
 impl BridgeState {
+    /// True when the lease generation changed since `gen0` was captured.
+    /// Long mutation handlers call this before each irreversible step and
+    /// abort when it returns true (audit 42 High-4): a lease hand-over
+    /// mid-flight must not let the previous holder's input land.
+    pub fn lease_gen_changed(&self, gen0: u64) -> bool {
+        self.lease_gen.load(std::sync::atomic::Ordering::SeqCst) != gen0
+    }
+
     pub fn new(config: Config) -> Self {
         Self {
             browser1: Mutex::new(Browser1::new()),
@@ -217,7 +255,10 @@ impl BridgeState {
             rate_buckets: Mutex::new(HashMap::new()),
             ax_mappers: Mutex::new(HashMap::new()),
             x11: StdMutex::new(None),
-            shutting_down: std::sync::atomic::AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            chrome_pid: AtomicU32::new(0),
+            lease_gen: AtomicU64::new(0),
+            inflight_mutations: AtomicU64::new(0),
             started_at: std::time::Instant::now(),
             internal_token: Uuid::new_v4().to_string(),
             config,

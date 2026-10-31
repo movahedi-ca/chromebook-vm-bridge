@@ -9,8 +9,18 @@
 //! `crate::input::x11_mouse`, fully visible on the attached display. The
 //! driver is fully synchronous blocking X11 I/O, so it always runs inside
 //! `tokio::task::spawn_blocking` and never holds the connection across
-//! `.await`. SEC-1: every visible coordinate is validated against a fresh
-//! geometry evaluation taken immediately before the action.
+//! `.await`.
+//!
+//! SEC-1 (audit 42 Critical-1): the window rect that gates visible input
+//! comes EXCLUSIVELY from X11 ground truth
+//! (`x11_mouse::resolve_window_rect`: `_NET_CLIENT_LIST` + `_NET_WM_PID`
+//! matched against the supervised child pid). Page-evaluated geometry
+//! (`window.screenX`, `outerWidth`, …) is attacker-influenced: it is used
+//! only for the X11 agreement check and for CSS sizing (`innerWidth` /
+//! `innerHeight`), never to position the gate rect. Visible input is
+//! refused when the X11 query fails, when `devicePixelRatio != 1`, when
+//! the page's origin story disagrees with X11, or when the lease
+//! generation changed mid-flight.
 //!
 //! Coordinate convention: CSS viewport pixels everywhere in the API, except
 //! the handlers explicitly documented as taking absolute screen pixels
@@ -23,7 +33,7 @@ use crate::browser::actions::{
 use crate::browser::geometry::{
     clamp_to_viewport, viewport_to_screen, WindowGeometry, GEOMETRY_JS,
 };
-use crate::input::x11_mouse::{WindowRect, X11Mouse};
+use crate::input::x11_mouse::{resolve_window_rect, X11Mouse};
 use crate::interact::react::FILL_REACT_JS;
 use crate::state::SharedState;
 use axum::{
@@ -35,7 +45,14 @@ use axum::{
 use chromiumoxide::Page;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+
+/// Agreement tolerance between the page-reported window origin
+/// (`window.screenX/screenY`) and X11 ground truth (audit 42 Critical-1).
+/// Small enough that a lying page cannot steer input onto another window;
+/// large enough for window-manager rounding.
+const WINDOW_ORIGIN_TOLERANCE_PX: i32 = 32;
 
 // ---------------------------------------------------------------------------
 // Request bodies (mirror the Req models of the bridge's HTTP contract).
@@ -66,6 +83,35 @@ pub struct ClickAtReq {
 pub struct ClickNodeReq {
     #[serde(rename = "backendNodeId")]
     pub backend_node_id: i64,
+}
+
+/// POST `/browser/node_box` — `{backendNodeId}`. Read-only: DOM.resolveNode +
+/// DOM.getBoxModel; returns the content quad and its center in viewport
+/// coords. NO input is ever dispatched (audit 42 High-7): AI-escalation
+/// tooling locates nodes through this endpoint, never through
+/// `click_node` as a "dry run".
+pub async fn node_box(
+    State(state): State<SharedState>,
+    Json(req): Json<ClickNodeReq>,
+) -> impl IntoResponse {
+    let res: anyhow::Result<(StatusCode, Json<serde_json::Value>)> = async {
+        let page = active_page(&state).await?;
+        let (x, y, quad) = tokio::time::timeout(
+            Duration::from_secs(30),
+            crate::browser::actions::node_box(&page, req.backend_node_id),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("node_box timed out"))??;
+        Ok((
+            StatusCode::OK,
+            Json(json!({"ok": true, "at": {"x": x, "y": y}, "quad": quad})),
+        ))
+    }
+    .await;
+    match res {
+        Ok(tup) => tup.into_response(),
+        Err(e) => bad_gateway(e),
+    }
 }
 
 #[derive(Deserialize)]
@@ -143,7 +189,7 @@ fn bad_gateway(err: impl std::fmt::Display) -> Response {
 
 /// Evaluate `GEOMETRY_JS` in the page and deserialize into `WindowGeometry`.
 /// Always evaluated fresh, never cached across navigations or actions.
-async fn window_geometry(page: &Page) -> anyhow::Result<WindowGeometry> {
+pub(crate) async fn window_geometry(page: &Page) -> anyhow::Result<WindowGeometry> {
     let v = eval_json(page, GEOMETRY_JS).await?;
     serde_json::from_value::<WindowGeometry>(v)
         .map_err(|e| anyhow::anyhow!("bad geometry shape: {e}"))
@@ -159,39 +205,87 @@ async fn screen_to_viewport(page: &Page, sx: f64, sy: f64) -> anyhow::Result<(f6
     ))
 }
 
-/// Verified Chrome window rect for the SEC-1 gate inside the X11 driver.
-/// Full window (including chrome); the caller clamps the target point into
-/// the inner viewport before driving.
-#[allow(clippy::cast_sign_loss)] // .max(0) guarantees non-negative before i32->u32
-fn window_rect(geom: &WindowGeometry) -> WindowRect {
-    WindowRect {
-        x: geom.screen_x,
-        y: geom.screen_y,
-        w: geom.outer_w.max(0) as u32,
-        h: geom.outer_h.max(0) as u32,
-    }
-}
-
 /// Drive the REAL OS cursor to a viewport point and click, fully visible on
 /// the display. Runs the blocking `XTest` driver in `spawn_blocking`; the
 /// returned coordinates are absolute screen pixels.
 /// The display comes from config (audit 41 LOW-6): `X11Mouse` used to read
 /// ambient $DISPLAY, which silently diverges from the configured display
 /// the browser was spawned on.
+///
+/// TRUST (audit 42 Critical-1): the SEC-1 gate rect and the viewport origin
+/// come EXCLUSIVELY from `resolve_window_rect` (X11: `_NET_CLIENT_LIST` +
+/// `_NET_WM_PID` == supervised child pid). The fresh page geometry is used
+/// only for (a) the `devicePixelRatio == 1` refusal, (b) the agreement
+/// check of the page's origin story against X11, and (c) `innerWidth` /
+/// `innerHeight` CSS sizing — which cannot move the rect. `gen0` is the
+/// lease generation captured at admission: a hand-over mid-flight aborts
+/// before any `XTest` input is emitted (audit 42 High-4).
 #[allow(clippy::cast_possible_truncation)] // viewport f64 -> i32 screen px; finite and range-checked downstream
-async fn visible_click(
-    display: &str,
+pub(crate) async fn visible_click(
+    state: &SharedState,
     vx: f64,
     vy: f64,
     geom: &WindowGeometry,
+    gen0: u64,
 ) -> anyhow::Result<(i32, i32)> {
-    let (sx, sy) = viewport_to_screen(vx.round() as i32, vy.round() as i32, geom);
-    let (sx, sy) = clamp_to_viewport(sx, sy, geom);
-    let rect = window_rect(geom);
-    let display = display.to_string();
+    // HiDPI breaks the CSS-px == screen-px assumption: refuse rather than
+    // click blind.
+    if (geom.device_pixel_ratio - 1.0).abs() > 1e-9 {
+        anyhow::bail!(
+            "visible input refused: devicePixelRatio is {}, need 1",
+            geom.device_pixel_ratio
+        );
+    }
+    let pid = state.chrome_pid.load(Ordering::SeqCst);
+    if pid == 0 {
+        anyhow::bail!(
+            "visible input refused: Chrome child pid unknown (browser not supervised yet)"
+        );
+    }
+    // Lease hand-over mid-flight: abort before any irreversible input.
+    if state.lease_gen_changed(gen0) {
+        anyhow::bail!("visible input refused: lease changed mid-flight");
+    }
+    let display = state.config.display.clone();
+    // X11 ground truth for the gate rect. NEVER page JS.
+    let rect =
+        tokio::task::spawn_blocking(move || resolve_window_rect(Some(display.as_str()), pid))
+            .await
+            .map_err(|e| anyhow::anyhow!("window-resolve task failed: {e}"))?
+            .map_err(|e| anyhow::anyhow!("visible input refused: {e}"))?;
+    // Agreement: the page's story about the window origin must match X11.
+    // A hostile page reporting a shifted origin is refused loudly.
+    if (geom.screen_x - rect.x).abs() > WINDOW_ORIGIN_TOLERANCE_PX
+        || (geom.screen_y - rect.y).abs() > WINDOW_ORIGIN_TOLERANCE_PX
+    {
+        anyhow::bail!(
+            "visible input refused: page-reported origin ({},{}) disagrees with X11 ({},{})",
+            geom.screen_x,
+            geom.screen_y,
+            rect.x,
+            rect.y
+        );
+    }
+    // Viewport math anchored on the X11 rect: build a synthetic geometry
+    // whose origin/size are X11-derived and whose inner size is the page's
+    // CSS math. Page values can no longer move the rect.
+    let x11_w = i32::try_from(rect.w).unwrap_or(i32::MAX);
+    let x11_h = i32::try_from(rect.h).unwrap_or(i32::MAX);
+    let anchored = WindowGeometry {
+        screen_x: rect.x,
+        screen_y: rect.y,
+        outer_w: x11_w,
+        outer_h: x11_h,
+        inner_w: geom.inner_w,
+        inner_h: geom.inner_h,
+        device_pixel_ratio: geom.device_pixel_ratio,
+    };
+    let (sx, sy) = viewport_to_screen(vx.round() as i32, vy.round() as i32, &anchored);
+    let (sx, sy) = clamp_to_viewport(sx, sy, &anchored);
+    let display = state.config.display.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<(i32, i32)> {
         let mut mouse = X11Mouse::new(Some(display.as_str()))?;
-        mouse.set_window_rect(rect);
+        mouse.set_window_rect(rect); // X11 ground truth ONLY — never page JS
         mouse.click(sx, sy)?;
         Ok((sx, sy))
     })
@@ -258,15 +352,34 @@ async fn click_then_type(page: &Page, selector: &str, text: &str) -> anyhow::Res
 /// Evaluate JS and cap a string result at ~200KB so a huge page dump can
 /// never blow up the response. Shared by /browser/eval and /pool/eval
 /// (audit 41 LOW-9).
+///
+/// Audit 42 High-5: string results are PII/secret-redacted on the way
+/// out. Audit 42 Medium: the old cap applied to strings ONLY — a huge
+/// object/array result passed through uncapped. Non-string results are
+/// now capped on their serialized size with an explicit truncation
+/// marker, so no eval result can exceed the cap in any shape.
 pub(crate) async fn eval_capped(page: &Page, js: &str) -> anyhow::Result<serde_json::Value> {
     const MAX_CHARS: usize = 200_000;
     let v = eval_json(page, js).await?;
     match v {
-        serde_json::Value::String(s) if s.chars().count() > MAX_CHARS => {
-            let truncated: String = s.chars().take(MAX_CHARS).collect();
-            Ok(json!(format!("{}...[truncated]", truncated)))
+        serde_json::Value::String(s) => {
+            let (redacted, _) = crate::privy::redact(&s);
+            if redacted.chars().count() > MAX_CHARS {
+                let truncated: String = redacted.chars().take(MAX_CHARS).collect();
+                Ok(json!(format!("{}...[truncated]", truncated)))
+            } else {
+                Ok(serde_json::Value::String(redacted))
+            }
         }
-        other => Ok(other),
+        other => {
+            let serialized = serde_json::to_string(&other).unwrap_or_default();
+            if serialized.chars().count() > MAX_CHARS {
+                let truncated: String = serialized.chars().take(MAX_CHARS).collect();
+                Ok(json!(format!("{}...[truncated]", truncated)))
+            } else {
+                Ok(other)
+            }
+        }
     }
 }
 
@@ -284,10 +397,13 @@ pub async fn click(
         let page = active_page(&state).await?;
         let (x, y) = element_center(&page, &req.selector).await?;
         if req.visible {
+            // Lease generation at admission: a hand-over mid-flight aborts
+            // the visible input before any XTest event (audit 42 High-4).
+            let gen0 = state.lease_gen.load(Ordering::SeqCst);
             let geom = window_geometry(&page).await?;
             let (sx, sy) = tokio::time::timeout(
                 Duration::from_secs(60),
-                visible_click(&state.config.display, x, y, &geom),
+                visible_click(&state, x, y, &geom, gen0),
             )
             .await
             .map_err(|_| anyhow::anyhow!("visible click timed out"))??;
@@ -541,10 +657,12 @@ pub async fn fill(State(state): State<SharedState>, Json(req): Json<FillReq>) ->
         let mut mode = "native";
         if req.visible {
             let (x, y) = element_center(&page, &req.selector).await?;
+            // Lease generation at admission (audit 42 High-4).
+            let gen0 = state.lease_gen.load(Ordering::SeqCst);
             let geom = window_geometry(&page).await?;
             tokio::time::timeout(
                 Duration::from_secs(60),
-                visible_click(&state.config.display, x, y, &geom),
+                visible_click(&state, x, y, &geom, gen0),
             )
             .await
             .map_err(|_| anyhow::anyhow!("visible click timed out"))??;

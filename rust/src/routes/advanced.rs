@@ -25,6 +25,7 @@ use crate::interact::autocomplete::{exact_match, AUTOCOMPLETE_COMMIT_JS, AUTOCOM
 use crate::interact::react::FILL_REACT_JS;
 use crate::interact::upload::{validate_upload_path, UPLOAD_STAGE1_JS};
 use crate::privy::validate_navigate_url;
+use crate::routes::input::{visible_click, window_geometry};
 use crate::state::SharedState;
 use axum::{
     body::Body,
@@ -406,8 +407,9 @@ pub struct OrderRequest {
     pub value: String, // text to fill (for fill action)
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
-    /// Accepted for contract compatibility. Input is always CDP-native in
-    /// this implementation; there is no separate visible-cursor mode.
+    /// Accepted for contract compatibility. When true, the click is driven
+    /// through the visible X11/XTest cursor (same hardened path as
+    /// /browser/click visible=true); otherwise input is CDP-native.
     #[serde(default)]
     pub visible: bool,
 }
@@ -415,12 +417,13 @@ pub struct OrderRequest {
 /// POST /browser/order — click or fill by visible text / ARIA role.
 ///
 /// Resolves the target deterministically in-page (no screenshot
-/// round-trip), then dispatches real CDP input at its center.
+/// round-trip), then dispatches real input at its center: CDP-native by
+/// default, or the visible X11 cursor when `visible=true` (audit 42
+/// Medium — the flag was accepted but silently ignored).
 pub async fn order(
     State(state): State<SharedState>,
     Json(req): Json<OrderRequest>,
 ) -> impl IntoResponse {
-    let _ = req.visible; // contract field; input is always CDP-native here
     let action = req.action.trim().to_lowercase();
     if action != "click" && action != "fill" {
         return err(
@@ -443,21 +446,47 @@ pub async fn order(
     let Some((x, y)) = target else {
         return ok_json(json!({"ok": false, "error": format!("could not resolve '{}'", req.text)}));
     };
-    if action == "click" {
-        if let Err(e) = mouse_click(&page, x, y).await {
-            return err(StatusCode::BAD_GATEWAY, format!("click failed: {e}"));
+    // Lease generation at admission: a hand-over mid-flight aborts the
+    // visible input before any XTest event (audit 42 High-4).
+    let gen0 = state.lease_gen.load(std::sync::atomic::Ordering::SeqCst);
+    // Dispatch one real click at the resolved center, natively or via the
+    // visible cursor.
+    let click_at = |visible: bool| {
+        let state = &state;
+        let page = &page;
+        async move {
+            if visible {
+                let geom = window_geometry(page).await?;
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    visible_click(state, x, y, &geom, gen0),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("visible click timed out"))??;
+                Ok::<_, anyhow::Error>("visible")
+            } else {
+                mouse_click(page, x, y).await?;
+                Ok("native")
+            }
         }
-        ok_json(json!({"ok": true, "at": {"x": x.round(), "y": y.round()}, "mode": "native"}))
+    };
+    if action == "click" {
+        let mode = match click_at(req.visible).await {
+            Ok(m) => m,
+            Err(e) => return err(StatusCode::BAD_GATEWAY, format!("click failed: {e}")),
+        };
+        ok_json(json!({"ok": true, "at": {"x": x.round(), "y": y.round()}, "mode": mode}))
     } else {
         // Focus with a real click so frameworks move focus correctly,
         // then set the value through the native prototype setter.
-        if let Err(e) = mouse_click(&page, x, y).await {
-            return err(StatusCode::BAD_GATEWAY, format!("focus click failed: {e}"));
-        }
+        let mode = match click_at(req.visible).await {
+            Ok(m) => m,
+            Err(e) => return err(StatusCode::BAD_GATEWAY, format!("focus click failed: {e}")),
+        };
         if let Err(e) = fill_focused(&page, &req.value).await {
             return err(StatusCode::BAD_GATEWAY, format!("fill failed: {e}"));
         }
-        ok_json(json!({"ok": true, "mode": "native"}))
+        ok_json(json!({"ok": true, "mode": mode}))
     }
 }
 
@@ -1127,12 +1156,13 @@ pub async fn upload(
             format!("upload path is not a file: {}", req.path),
         );
     }
-    // 2. Canonicalize and enforce the staging allowlist.
+    // 2. Canonicalize and enforce the staging allowlist. This is the
+    // early check; the path is re-validated immediately before Chrome
+    // reads it (step 4) to close the TOCTOU window (audit 42 Medium).
     let allowlist = state.config.upload_dirs.clone();
-    let canonical = match validate_upload_path(&req.path, &allowlist) {
-        Ok(p) => p,
-        Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
-    };
+    if let Err(e) = validate_upload_path(&req.path, &allowlist) {
+        return err(StatusCode::BAD_REQUEST, e.to_string());
+    }
     let page = match active_page(&state).await {
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_GATEWAY, format!("no active page: {e}")),
@@ -1209,6 +1239,20 @@ pub async fn upload(
     }
     // 4. Attach the file. The browser dispatches native input/change
     //    events; the OS dialog never opens.
+    //    Re-validate the path IMMEDIATELY before handing it to Chrome
+    //    (audit 42 Medium — upload TOCTOU): the allowlist check at step 2
+    //    and this use are separated by slow DOM round-trips, so a
+    //    symlink/file swap in between would otherwise redirect the
+    //    upload. The re-validated canonical path is what Chrome reads.
+    let canonical = match validate_upload_path(&req.path, &allowlist) {
+        Ok(p) => p,
+        Err(e) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!("upload path re-validation failed: {e}"),
+            )
+        }
+    };
     let set_params = match SetFileInputFilesParams::builder()
         .files(vec![canonical.to_string_lossy().into_owned()])
         .node_id(found.node_id)
@@ -1287,7 +1331,7 @@ mod tests {
     fn diff_identical_scores_one() {
         let a = solid_png(8, 8, 200, 200, 200);
         let d = diff_images(&a, &a, 10).unwrap();
-        assert_eq!(d.score, 1.0);
+        assert!((d.score - 1.0).abs() < f64::EPSILON);
         assert_eq!(d.changed, 0);
         assert!(d.bbox.is_none());
     }
@@ -1309,7 +1353,7 @@ mod tests {
         let a = solid_png(8, 8, 200, 200, 200);
         let b = solid_png(4, 4, 200, 200, 200);
         let d = diff_images(&a, &b, 10).unwrap();
-        assert_eq!(d.score, 1.0);
+        assert!((d.score - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]

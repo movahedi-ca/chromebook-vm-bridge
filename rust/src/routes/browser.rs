@@ -6,6 +6,7 @@
 //! 3. Run the CDP/JS operation with timeout
 //! 4. Return JSON with token-efficient shapes
 
+use crate::browser::actions::install_blocked_url_patterns;
 use crate::browser::tabs::ensure_browser;
 use crate::routes::not_implemented;
 use crate::routes::read::{capture_png, page_url_title};
@@ -39,53 +40,15 @@ pub async fn navigate(
                 .into_response()
         }
     };
-    // Fast path: reuse the active tab under a read lock. The guard is
-    // scoped to this block and DROPPED before the else branch: holding a
-    // read guard across `state.tabs.write()` below would deadlock (the
-    // `if let` scrutinee temporary lives for the whole if/else).
-    // No CDP call is ever made while holding the tabs lock (audit 41
-    // MED-1): opening a page is a slow round-trip that used to block every
-    // read endpoint (/browser/tabs, /health's tab_count, ...) behind a
-    // write lock.
-    let active = {
-        let tabs = state.tabs.read().await;
-        tabs.active_ref()
-            .map(|a| (a.page.clone(), a.id.clone()))
+    let (page, tab_id) = match acquire_nav_tab(&state, &browser, url.as_str()).await {
+        Ok(t) => t,
+        Err(r) => return *r,
     };
-    let (page, tab_id, evicted) = match active {
-        Some((page, id)) => (
-            page,
-            id,
-            Vec::<std::sync::Arc<chromiumoxide::Page>>::new(),
-        ),
-        None => match browser.new_page(url.as_str()).await {
-            Ok(p) => {
-                let page = std::sync::Arc::new(p);
-                let id = uuid::Uuid::new_v4().to_string();
-                // Write lock held only for the registry insert.
-                let ev = state.tabs.write().await.insert(crate::state::TabEntry {
-                    id: id.clone(),
-                    page: page.clone(),
-                    baseline_hash: None,
-                    url: url.to_string(),
-                    title: String::new(),
-                });
-                (page, id, ev)
-            }
-            Err(e) => {
-                // 503: the browser (our dependency) failed to open a
-                // page — retryable, not a bridge bug (audit 41 LOW-10).
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({"ok": false, "error": format!("new page: {}", e)})),
-                )
-                    .into_response();
-            }
-        },
-    };
-    for p in evicted {
-        crate::browser::actions::close_page(&p).await;
-    }
+    // Defense in depth: literal-IP block patterns on this target, so a
+    // literal-IP subresource/redirect inside the renderer is blocked even
+    // if a Rust-side check were ever bypassed (audit 42 High-1).
+    // Best-effort; the Rust firewall stays the primary gate.
+    install_blocked_url_patterns(&page).await;
     let nav_result = tokio::time::timeout(Duration::from_secs(30), async {
         page.goto(url.as_str()).await
     })
@@ -93,16 +56,7 @@ pub async fn navigate(
     match nav_result {
         Ok(Ok(_)) => {
             let (final_url, title) = page_url_title(&page).await;
-            // Capture the verification baseline once navigation settles so
-            // /browser/state's hash_match reflects reality (audit 41 MED-4).
-            // Best-effort: a failed capture leaves baseline None (unknown),
-            // which can never produce a false match.
-            capture_baseline(&state, &tab_id, &page).await;
-            (
-                StatusCode::OK,
-                Json(json!({"title": title, "url": final_url, "verified": true})),
-            )
-                .into_response()
+            finish_navigation(&state, &tab_id, &page, &final_url, &title).await
         }
         Ok(Err(e)) => (
             StatusCode::BAD_GATEWAY,
@@ -114,6 +68,105 @@ pub async fn navigate(
             Json(json!({"ok": false, "error": "navigation timeout"})),
         )
             .into_response(),
+    }
+}
+
+/// Reuse the active tab under a read lock, else open a new page and
+/// register it. The read guard is dropped before the else branch: holding
+/// it across `state.tabs.write()` would deadlock (the `if let` scrutinee
+/// temporary lives for the whole if/else). No CDP call is ever made while
+/// holding the tabs lock (audit 41 MED-1): opening a page is a slow
+/// round-trip that used to block every read endpoint (`/browser/tabs`,
+/// `/health`'s `tab_count`, ...) behind a write lock.
+async fn acquire_nav_tab(
+    state: &SharedState,
+    browser: &chromiumoxide::Browser,
+    url: &str,
+) -> Result<(std::sync::Arc<chromiumoxide::Page>, String), Box<axum::response::Response>> {
+    let active = {
+        let tabs = state.tabs.read().await;
+        tabs.active_ref().map(|a| (a.page.clone(), a.id.clone()))
+    };
+    if let Some((page, id)) = active {
+        Ok((page, id))
+    } else {
+        // 503: the browser (our dependency) failed to open a
+        // page — retryable, not a bridge bug (audit 41 LOW-10).
+        let p = browser.new_page(url).await.map_err(|e| {
+            Box::new(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"ok": false, "error": format!("new page: {}", e)})),
+                )
+                    .into_response(),
+            )
+        })?;
+        let page = std::sync::Arc::new(p);
+        let id = uuid::Uuid::new_v4().to_string();
+        // Write lock held only for the registry insert.
+        let evicted = state.tabs.write().await.insert(crate::state::TabEntry {
+            id: id.clone(),
+            page: page.clone(),
+            baseline_hash: None,
+            url: url.to_string(),
+            title: String::new(),
+        });
+        for p in evicted {
+            crate::browser::actions::close_page(&p).await;
+        }
+        Ok((page, id))
+    }
+}
+
+/// Post-goto handling for `/browser/navigate`: re-run the SSRF firewall
+/// on the LANDED url (audit 42 High-1 — the requested URL passed
+/// validation, but redirects and in-page navigations can land where the
+/// firewall would have refused) and fail closed. On success, write the
+/// final URL/title back into the registry (audit 42 Medium-4) so
+/// /browser/tabs never serves the stale requested URL and `verified`
+/// reflects the landed URL's SSRF check — not a hardcoded true.
+async fn finish_navigation(
+    state: &SharedState,
+    tab_id: &str,
+    page: &std::sync::Arc<chromiumoxide::Page>,
+    final_url: &str,
+    title: &str,
+) -> axum::response::Response {
+    match crate::privy::validate_navigate_url(final_url, &[]).await {
+        Ok(_) => {
+            {
+                let mut tabs = state.tabs.write().await;
+                tabs.set_url_title(tab_id, final_url, title);
+            }
+            // Capture the verification baseline once navigation settles so
+            // /browser/state's hash_match reflects reality (audit 41 MED-4).
+            // Best-effort: a failed capture leaves baseline None (unknown),
+            // which can never produce a false match.
+            capture_baseline(state, tab_id, page).await;
+            (
+                StatusCode::OK,
+                Json(json!({"title": title, "url": final_url, "verified": true})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::warn!(
+                tab_id,
+                final_url,
+                error = %e,
+                "landed URL failed post-navigation SSRF re-check; failing closed"
+            );
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("landed URL blocked: {e}"),
+                    "url": final_url,
+                    "verified": false,
+                })),
+            )
+                .into_response()
+        }
     }
 }
 

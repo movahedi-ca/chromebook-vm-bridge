@@ -235,7 +235,7 @@ chmod 700 "$CB_CM_DIR" 2>/dev/null
 mkdir -p "$(dirname "$CB_AUDIT_LOG")" 2>/dev/null
 
 SSH_BASE=(ssh -i "$CB_KEY"
-  -o BatchMode=yes -o ConnectTimeout=20
+  -o BatchMode=yes -o ConnectTimeout=20 -o IdentitiesOnly=yes
   -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$CB_PINNED"
   -o ControlMaster=auto -o ControlPath="$CB_CP" -o ControlPersist=600
   -o ServerAliveInterval=30 -o ServerAliveCountMax=3

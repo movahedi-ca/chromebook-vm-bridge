@@ -34,6 +34,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use x11rb::connection::Connection;
+use x11rb::protocol::xproto::AtomEnum;
 use x11rb::protocol::xproto::ConnectionExt as _;
 use x11rb::protocol::xproto::Window;
 use x11rb::protocol::xtest::ConnectionExt as _;
@@ -100,6 +101,85 @@ pub fn check_in_window(rect: Option<&WindowRect>, x: i32, y: i32) -> Result<()> 
             r.h
         ))
     }
+}
+
+/// Resolve the supervised Chrome window's rectangle from X11 ground truth
+/// (audit 42 Critical-1).
+///
+/// Enumerates `_NET_CLIENT_LIST`, matches `_NET_WM_PID` against the
+/// supervisor's child pid, and translates the window origin to root
+/// coordinates. Page-reported geometry (`window.screenX`, `outerWidth`,
+/// …) is NEVER consulted here: a hostile page controls those values and
+/// could otherwise steer the SEC-1 gate rect — and with it root-equivalent
+/// `XTest` input — onto another window on the shared display.
+///
+/// `translate_coords` direction (do not "simplify"): the RECEIVER is the
+/// window and the destination is the root, so the reply is the window's
+/// origin in root coordinates. The old inverted call (`root` as receiver)
+/// answered "where is the root origin inside the window" and produced
+/// BUG-1; it must never come back.
+///
+/// Blocking X11 I/O: callers MUST wrap this in `spawn_blocking`.
+pub fn resolve_window_rect(display: Option<&str>, chrome_pid: u32) -> Result<WindowRect> {
+    let (conn, screen_num) =
+        RustConnection::connect(display).context("connecting to X11 display")?;
+    let root = conn.setup().roots[screen_num].root;
+    let client_list_atom = conn
+        .intern_atom(false, b"_NET_CLIENT_LIST")
+        .context("intern _NET_CLIENT_LIST")?
+        .reply()
+        .context("intern _NET_CLIENT_LIST reply")?
+        .atom;
+    let wm_pid_atom = conn
+        .intern_atom(false, b"_NET_WM_PID")
+        .context("intern _NET_WM_PID")?
+        .reply()
+        .context("intern _NET_WM_PID reply")?
+        .atom;
+    let list = conn
+        .get_property(false, root, client_list_atom, AtomEnum::WINDOW, 0, u32::MAX)
+        .context("read _NET_CLIENT_LIST")?
+        .reply()
+        .context("_NET_CLIENT_LIST reply")?;
+    if list.format != 32 {
+        anyhow::bail!("_NET_CLIENT_LIST has unexpected format {}", list.format);
+    }
+    for win_bytes in list.value.chunks_exact(4) {
+        let win = u32::from_ne_bytes([win_bytes[0], win_bytes[1], win_bytes[2], win_bytes[3]]);
+        let Ok(prop) = conn
+            .get_property(false, win, wm_pid_atom, AtomEnum::CARDINAL, 0, 1)
+            .context("read _NET_WM_PID")?
+            .reply()
+        else {
+            continue;
+        };
+        if prop.format != 32 || prop.value.len() < 4 {
+            continue;
+        }
+        let pid = u32::from_ne_bytes([prop.value[0], prop.value[1], prop.value[2], prop.value[3]]);
+        if pid != chrome_pid {
+            continue;
+        }
+        let pos = conn
+            .translate_coordinates(win, root, 0, 0)
+            .context("translate_coords")?
+            .reply()
+            .context("translate_coords reply")?;
+        let geo = conn
+            .get_geometry(win)
+            .context("get_geometry")?
+            .reply()
+            .context("get_geometry reply")?;
+        return Ok(WindowRect {
+            x: i32::from(pos.dst_x),
+            y: i32::from(pos.dst_y),
+            w: u32::from(geo.width),
+            h: u32::from(geo.height),
+        });
+    }
+    Err(anyhow!(
+        "no X11 window with _NET_WM_PID={chrome_pid} on this display"
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +453,20 @@ impl X11Mouse {
         check_in_window(self.window_rect.as_ref(), x, y)
     }
 
+    /// Reject a whole trajectory when ANY point would leave the window
+    /// rect (audit 42 Medium): the overshoot leg and per-point jitter can
+    /// push intermediate points outside even when both endpoints are
+    /// inside. Rejection (not clamping) preserves the driver's contract —
+    /// a clamped path would click somewhere the caller never asked for.
+    fn check_trajectory(&self, pts: &[Pt]) -> Result<()> {
+        for &(px, py) in pts {
+            // Same rounding the emitter applies, so the check sees exactly
+            // what XTest would receive.
+            self.check(px.round() as i32, py.round() as i32)?;
+        }
+        Ok(())
+    }
+
     /// Live pointer position from the X server. Called before EVERY
     /// trajectory — never trust a cached position on a watched display.
     fn query_pos(&self, conn: &RustConnection) -> Result<(i32, i32)> {
@@ -478,6 +572,7 @@ impl X11Mouse {
             f64::from(y),
             &mut rng,
         );
+        self.check_trajectory(&pts)?;
         self.emit_trajectory(&conn, &pts, &mut rng)?;
         thread::sleep(Duration::from_secs_f64(rng.uniform(0.05, 0.14))); // hover
         self.button(&conn, true, 1)?;
@@ -506,6 +601,7 @@ impl X11Mouse {
             f64::from(y),
             &mut rng,
         );
+        self.check_trajectory(&pts)?;
         self.emit_trajectory(&conn, &pts, &mut rng)?;
         thread::sleep(Duration::from_secs_f64(rng.uniform(0.05, 0.12)));
         self.button(&conn, true, 1)?;
@@ -540,6 +636,7 @@ impl X11Mouse {
             f64::from(y1),
             &mut rng,
         );
+        self.check_trajectory(&to_start)?;
         self.emit_trajectory(&conn, &to_start, &mut rng)?;
 
         thread::sleep(Duration::from_secs_f64(rng.uniform(0.05, 0.14)));
@@ -554,6 +651,7 @@ impl X11Mouse {
             f64::from(y2),
             &mut rng,
         );
+        self.check_trajectory(&stroke)?;
         let total = polyline_len(&stroke).max(1.0);
         let wob_phase = rng.uniform(0.0, std::f64::consts::TAU);
         let seg_ang = (f64::from(y2) - f64::from(y1)).atan2(f64::from(x2) - f64::from(x1))
@@ -673,7 +771,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::assert_is_empty)] // is_empty() is clearer than assert_ne! against an empty array literal
     fn arc_length_uniform() {
         // Resampled segments should have low variance: uniform spacing.
         let mut rng = XorShift64::seeded();

@@ -91,6 +91,22 @@ pub fn dhash(image_bytes: &[u8]) -> u64 {
 }
 
 fn dhash_opt(image_bytes: &[u8]) -> Option<u64> {
+    // Audit 42 Medium: cap the pixel count BEFORE decoding. A crafted PNG
+    // can declare enormous dimensions (decompression bomb) and
+    // load_from_memory would happily allocate it. Read the header only;
+    // refuse anything over 64 megapixels (16x a 4K frame — far above the
+    // 1920x1080 screenshots this pipeline ever sees).
+    const MAX_PIXELS: u64 = 64_000_000;
+    let dims = image::ImageReader::new(std::io::Cursor::new(image_bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    let pixels = u64::from(dims.0).saturating_mul(u64::from(dims.1));
+    if pixels > MAX_PIXELS {
+        tracing::warn!(pixels, "dhash: image exceeds pixel cap; refusing");
+        return None;
+    }
     let img = image::load_from_memory(image_bytes).ok()?;
     let gray = img.to_luma8();
     // 9x8, nearest: deterministic and cheap. Any resampling filter would do

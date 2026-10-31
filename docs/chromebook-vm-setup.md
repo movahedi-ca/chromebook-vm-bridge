@@ -33,6 +33,13 @@ No secrets live in this repo: the API key is deployed out-of-band (see
   (`~/.config/chrome-automation`), seeded once from the main profile copy so
   signed-in sessions persist. Re-sync the seed after any new login,
   otherwise sessions go stale. The bridge never touches the main profile.
+- Seeding rule (audit 42 Medium-13): NEVER copy `Login Data` or
+  `Login Data-journal` into the automation profile. Chrome runs with
+  `--password-store=basic`, so anything in Login Data sits in a plaintext
+  SQLite file readable by anyone with bridge/filesystem access. Cookies
+  (signed-in sessions) are what the seed is for; saved passwords stay in
+  the main profile only. This rule applies to future seeds — the live
+  automation profile is left untouched.
 - The spawn/supervise layer is a **swappable backend** behind a
   `BrowserBackend` trait (launch, health check, kill, CDP URL); Chrome is
   the first implementation. A future engine plugs in as a second backend

@@ -24,6 +24,10 @@ EnvironmentFile=-%h/.config/vm-bridge/env
 # Production: live port and the dedicated automation profile (sessions persist
 # here; seeded once from the chrome-main copy). The bridge spawns and
 # supervises its own Chrome child — no external browser required.
+# VM_BRIDGE_BIND_ADDR is pinned to loopback (audit 42 Medium-7): the
+# bridge speaks plain HTTP with bearer-token auth, so a non-loopback
+# bind is refused at startup unless VM_BRIDGE_ALLOW_NON_LOOPBACK=1.
+Environment=VM_BRIDGE_BIND_ADDR=127.0.0.1
 Environment=VM_BRIDGE_BIND_PORT=8899
 Environment=VM_BRIDGE_PROFILE_DIR=%h/.config/chrome-automation
 Environment=DISPLAY=:1

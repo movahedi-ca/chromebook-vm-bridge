@@ -122,6 +122,12 @@ pub async fn run_supervisor(mut backend: Box<dyn BrowserBackend>, state: SharedS
                     match res {
                         Ok(()) => {
                             failures = 0;
+                            // Publish the supervised child pid for the
+                            // visible-input path (audit 42 Critical-1): it
+                            // resolves the Chrome window from X11
+                            // (_NET_WM_PID) instead of trusting page JS.
+                            let pid = backend.child_pid().unwrap_or(0);
+                            state.chrome_pid.store(pid, Ordering::SeqCst);
                             if booted {
                                 state.metrics.lock().await.relaunches += 1;
                                 tracing::warn!("browser relaunched and healthy");
@@ -153,6 +159,10 @@ pub async fn run_supervisor(mut backend: Box<dyn BrowserBackend>, state: SharedS
         // iteration respawns it. (CDP-level wedges are the watchdog's job;
         // it marks dead and lands on the same path.)
         if !backend.is_up().await {
+            // No live child: the published pid is stale; clear it so the
+            // visible-input path fails closed until the respawn publishes
+            // the new pid (audit 42 Critical-1).
+            state.chrome_pid.store(0, Ordering::SeqCst);
             let was_alive = {
                 let mut b = state.browser1.lock().await;
                 let was = b.is_alive();

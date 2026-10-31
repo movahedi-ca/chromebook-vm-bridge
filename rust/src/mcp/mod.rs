@@ -61,6 +61,31 @@ pub struct EvalParams {
     pub js: String,
 }
 
+/// Whether the MCP process environment authorizes browser tools
+/// (audit 42 High-9).
+///
+/// MCP stdio has no transport auth, no lease enforcement, and no rate
+/// limiting — unlike the HTTP API. The gate is possession of the secret:
+/// the MCP server process must have been spawned with `BRIDGE_API_KEY`
+/// or the scoped `VM_BRIDGE_KEYS__ACT` in its environment. Without it,
+/// every browser tool refuses with a clear error instead of silently
+/// operating unauthenticated.
+fn mcp_env_authorized() -> bool {
+    let present = |key: &str| std::env::var(key).is_ok_and(|v| !v.trim().is_empty());
+    present("BRIDGE_API_KEY") || present("VM_BRIDGE_KEYS__ACT")
+}
+
+fn mcp_auth_refusal(tool: &str) -> String {
+    json!({
+        "ok": false,
+        "error": format!(
+            "{tool} refused: MCP browser tools require BRIDGE_API_KEY or \
+             VM_BRIDGE_KEYS__ACT in the MCP server process environment"
+        ),
+    })
+    .to_string()
+}
+
 // ---------------------------------------------------------------------------
 // The MCP server
 // ---------------------------------------------------------------------------
@@ -76,11 +101,16 @@ impl BridgeMcp {
         Self { state }
     }
 
-    #[tool(description = "Navigate the browser to a URL (SSRF-filtered)")]
+    #[tool(
+        description = "Navigate the browser to a URL (SSRF-filtered). Requires BRIDGE_API_KEY or VM_BRIDGE_KEYS__ACT in the MCP server process environment."
+    )]
     async fn navigate(&self, #[tool(aggr)] params: NavigateParams) -> String {
+        use axum::response::IntoResponse;
+        if !mcp_env_authorized() {
+            return mcp_auth_refusal("navigate");
+        }
         // Delegate to the HTTP /browser/navigate handler (audit 40 HIGH-4):
         // this tool actually navigates now instead of merely validating.
-        use axum::response::IntoResponse;
         let resp = crate::routes::browser::navigate(
             axum::extract::State(self.state.clone()),
             axum::Json(crate::routes::browser::NavigateRequest { url: params.url }),
@@ -93,7 +123,9 @@ impl BridgeMcp {
         }
     }
 
-    #[tool(description = "Interactive accessibility snapshot with [ref=N] handles")]
+    #[tool(
+        description = "NOT IMPLEMENTED over MCP: use HTTP GET /browser/snapshot for the interactive accessibility snapshot"
+    )]
     async fn snapshot(&self, #[tool(aggr)] params: SnapshotParams) -> String {
         let max = params.max_nodes.unwrap_or(200);
         // TRACKED DECISION (was bare TODO): MCP snapshot stays a guidance
@@ -103,24 +135,32 @@ impl BridgeMcp {
         json!({"ok": false, "error": "snapshot via HTTP /browser/snapshot for now", "max_nodes": max}).to_string()
     }
 
-    #[tool(description = "Drain DOM mutation queue (what changed since last check)")]
+    #[tool(
+        description = "NOT IMPLEMENTED over MCP: use HTTP /browser/diff_state for the DOM mutation queue"
+    )]
     async fn diff(&self) -> String {
         json!({"ok": false, "error": "diff via HTTP /browser/diff_state for now"}).to_string()
     }
 
-    #[tool(description = "Click an element by [ref=N] handle (via HTTP /browser/click)")]
+    #[tool(
+        description = "NOT IMPLEMENTED over MCP: use HTTP POST /browser/click to click by [ref=N] handle"
+    )]
     async fn click_ref(&self, #[tool(aggr)] params: ClickRefParams) -> String {
         json!({"ok": false, "error": "click via HTTP /browser/click for now", "ref": params.r#ref})
             .to_string()
     }
 
-    #[tool(description = "Fill a field by [ref=N] (via HTTP /browser/fill)")]
+    #[tool(
+        description = "NOT IMPLEMENTED over MCP: use HTTP POST /browser/fill to fill by [ref=N]"
+    )]
     async fn fill_ref(&self, #[tool(aggr)] params: FillRefParams) -> String {
         json!({"ok": false, "error": "fill via HTTP /browser/fill for now", "ref": params.r#ref})
             .to_string()
     }
 
-    #[tool(description = "Resolve natural-language instruction to element refs")]
+    #[tool(
+        description = "NOT IMPLEMENTED over MCP: use HTTP POST /browser/order for natural-language element resolution"
+    )]
     async fn order(&self, #[tool(aggr)] params: OrderParams) -> String {
         json!({"ok": false, "error": "order via HTTP /browser/order for now", "instruction": params.instruction}).to_string()
     }
@@ -137,14 +177,21 @@ impl BridgeMcp {
         }
     }
 
-    #[tool(description = "Capture screenshot with Set-of-Marks overlay")]
+    #[tool(
+        description = "NOT IMPLEMENTED over MCP: use HTTP /browser/som_screenshot for the Set-of-Marks screenshot"
+    )]
     async fn screenshot_marks(&self) -> String {
         json!({"ok": false, "error": "screenshot via HTTP /browser/som_screenshot for now"})
             .to_string()
     }
 
-    #[tool(description = "Get current browser tabs")]
+    #[tool(
+        description = "Get current browser tabs. Requires BRIDGE_API_KEY or VM_BRIDGE_KEYS__ACT in the MCP server process environment."
+    )]
     async fn tabs(&self) -> String {
+        if !mcp_env_authorized() {
+            return mcp_auth_refusal("tabs");
+        }
         let tabs = self.state.tabs.read().await;
         let list: Vec<_> = tabs.list();
         // Estimate tokens: ~4 chars per token
@@ -153,7 +200,9 @@ impl BridgeMcp {
         json!({"ok": true, "tabs": list, "tokens_est": tokens_est}).to_string()
     }
 
-    #[tool(description = "Evaluate JavaScript (ADMIN scope only - prefer HTTP /browser/eval)")]
+    #[tool(
+        description = "NOT IMPLEMENTED over MCP: use HTTP POST /browser/eval (ADMIN scope) to evaluate JavaScript"
+    )]
     async fn eval(&self, #[tool(aggr)] params: EvalParams) -> String {
         json!({"ok": false, "error": "eval via HTTP /browser/eval for now (ADMIN scope)", "js_len": params.js.len()}).to_string()
     }
@@ -163,7 +212,17 @@ impl BridgeMcp {
 impl ServerHandler for BridgeMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
-            instructions: Some("vm-bridge MCP: browser automation via [ref=N] handles. Use snapshot to get refs, then click_ref/fill_ref.".into()),
+            // Honest about what is live over MCP (audit 42 High-9): only
+            // navigate and tabs execute here (gated on the process
+            // environment); every other tool is a pointer to its HTTP
+            // equivalent, not a working tool.
+            instructions: Some(
+                "vm-bridge MCP: only `navigate` and `tabs` are live over MCP \
+                 (they require BRIDGE_API_KEY or VM_BRIDGE_KEYS__ACT in the MCP \
+                 server process environment). All other tools are unimplemented \
+                 pointers — use their HTTP equivalents."
+                    .into(),
+            ),
             ..Default::default()
         }
     }
@@ -172,6 +231,13 @@ impl ServerHandler for BridgeMcp {
 /// Serve MCP over stdio (for Claude Code-style local clients).
 /// Run as: `vm-bridge --mcp-stdio`
 pub async fn serve_stdio(state: SharedState) -> anyhow::Result<()> {
+    if mcp_env_authorized() {
+        tracing::info!("MCP stdio: browser tools authorized via process environment");
+    } else {
+        tracing::warn!(
+            "MCP stdio: no BRIDGE_API_KEY or VM_BRIDGE_KEYS__ACT in process environment —              browser tools (navigate, tabs) will refuse"
+        );
+    }
     let service = BridgeMcp::new(state);
     let transport = (tokio::io::stdin(), tokio::io::stdout());
     let server = service

@@ -56,4 +56,12 @@ pub trait BrowserBackend: Send + Sync {
         &'a self,
         port: u16,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + 'a>>;
+
+    /// OS pid of the supervised browser child, if the backend tracks one.
+    /// The visible-input path uses it to resolve the Chrome window from
+    /// X11 ground truth (`_NET_WM_PID`); page-reported geometry is never
+    /// trusted for the input gate (audit 42 Critical-1). Default: unknown.
+    fn child_pid(&self) -> Option<u32> {
+        None
+    }
 }

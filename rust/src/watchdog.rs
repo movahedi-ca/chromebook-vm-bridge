@@ -21,7 +21,19 @@ use std::time::{Duration, Instant};
 pub(crate) fn sd_notify(state: &str) {
     if let Ok(sock_path) = std::env::var("NOTIFY_SOCKET") {
         use std::os::unix::net::UnixDatagram;
-        // Use unbound socket for sending (abstract namespace safe)
+        // Use unbound socket for sending.
+        //
+        // KNOWN LIMIT (audit 42 Medium): an abstract-namespace
+        // NOTIFY_SOCKET ("@name") is not supported — Rust std has no
+        // safe abstract-socket address constructor, and neither unsafe
+        // libc nor a new dependency is worth it here: systemd user units
+        // always set a filesystem path
+        // ($XDG_RUNTIME_DIR/systemd/notify). A leading @ is refused
+        // loudly instead of silently failing into the void.
+        if sock_path.starts_with('@') {
+            tracing::warn!("sd_notify: abstract-namespace NOTIFY_SOCKET is unsupported; skipping");
+            return;
+        }
         if let Ok(sock) = UnixDatagram::unbound() {
             let _ = sock.send_to(state.as_bytes(), &sock_path);
         }

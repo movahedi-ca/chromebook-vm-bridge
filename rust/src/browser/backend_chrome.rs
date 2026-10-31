@@ -96,6 +96,10 @@ impl ChromeBackend {
         let mut cmd = std::process::Command::new(&cfg.bin);
         cmd.arg(format!("--user-data-dir={}", cfg.profile_dir.display()))
             .arg(format!("--remote-debugging-port={}", cfg.debug_port))
+            // Audit 42 High-2: without this flag the DevTools port binds
+            // beyond loopback — an unauthenticated CDP control plane for
+            // any local process. Pin it to 127.0.0.1.
+            .arg("--remote-debugging-address=127.0.0.1")
             .args(CHROME_FLAGS)
             .arg("about:blank")
             .env("DISPLAY", &cfg.display)
@@ -170,6 +174,12 @@ impl Default for ChromeBackend {
 impl BrowserBackend for ChromeBackend {
     fn name(&self) -> &'static str {
         "chrome"
+    }
+
+    /// OS pid of the supervised Chrome child (audit 42 Critical-1: the
+    /// visible-input path matches this against `_NET_WM_PID` on X11).
+    fn child_pid(&self) -> Option<u32> {
+        self.child.as_ref().map(std::process::Child::id)
     }
 
     fn ensure_running<'a>(

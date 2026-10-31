@@ -139,6 +139,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/browser/click", post(routes::input::click))
         .route("/browser/click_at", post(routes::input::click_at))
         .route("/browser/click_node", post(routes::input::click_node))
+        .route("/browser/node_box", post(routes::input::node_box))
         .route("/browser/click_screen", post(routes::input::click_screen))
         .route("/browser/double_click", post(routes::input::double_click))
         .route("/browser/drag", post(routes::input::drag))

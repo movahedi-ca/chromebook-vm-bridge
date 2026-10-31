@@ -234,6 +234,16 @@ async fn decompress_capped(input: &[u8], max_out: usize) -> Result<Vec<u8>, Stri
 /// lease system's exclusivity would be illusory if pool mutations bypassed
 /// it (audit 41 MED-7 — the exemption dated from a "separate browser"
 /// architecture that no longer exists).
+///
+/// Audit 42 High-4 — the lease is HELD for in-flight mutations, not just
+/// checked at admission:
+/// - every mutating request increments `inflight_mutations` for the whole
+///   time it is inside its handler; `/lease/acquire` is rejected while
+///   any mutation is in flight, so a new lease can never be granted over
+///   someone's mid-flight mutation;
+/// - the lease lifecycle itself (`/lease/acquire|release|renew`) is exempt
+///   from the inflight count (it is not a browser mutation, and counting
+///   `/lease/acquire` would make the gate reject itself).
 pub async fn lease_middleware(
     State(state): State<SharedState>,
     req: Request<Body>,
@@ -267,6 +277,18 @@ pub async fn lease_middleware(
             )
                 .into_response();
         }
+        // Hold the lease across the whole handler: a lease hand-over
+        // (release + acquire by someone else) while this mutation is in
+        // flight bumps the generation, and long handlers abort before
+        // their irreversible steps when they see the change.
+        state
+            .inflight_mutations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let resp = next.run(req).await;
+        state
+            .inflight_mutations
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        return resp;
     }
 
     next.run(req).await
@@ -283,7 +305,16 @@ pub async fn log_middleware(
     let start = std::time::Instant::now();
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    let resp = next.run(req).await;
+    let mut resp = next.run(req).await;
+    // Audit 42 Low: no bridge response is cacheable (sessions, page
+    // content, lease state). Tell clients and intermediaries not to store
+    // anything.
+    resp.headers_mut().insert(
+        "cache-control",
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    resp.headers_mut()
+        .insert("pragma", axum::http::HeaderValue::from_static("no-cache"));
     let elapsed = start.elapsed();
     {
         let mut m = state.metrics.lock().await;

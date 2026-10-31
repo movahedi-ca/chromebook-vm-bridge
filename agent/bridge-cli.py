@@ -6,8 +6,11 @@ goes through `cb-job.sh run` over the SSH tunnel; the JSON body is base64'd
 into argv so no shell quoting is ever needed.
 
 Auth: the API key is NOT held here. curl reads it on the VM from
-~/.config/vm-bridge/api-key (mode 600), so the key never crosses SSH argv
-and never appears in the activity panel or logs.
+~/.config/vm-bridge/env (mode 600) — the same EnvironmentFile the
+vm-bridge-rs systemd unit uses — so the CLI and the server can never
+disagree about which key file is authoritative. The key is extracted
+with a remote-shell command substitution, never placed in argv, so it
+never crosses SSH argv and never appears in the activity panel or logs.
 
 Usage:
     bridge-cli.py health
@@ -134,7 +137,30 @@ def _gemini_selector(action, text):
 HERE = os.path.dirname(os.path.abspath(__file__))
 CB_JOB = os.path.join(HERE, "cb-job.sh")
 BASE = "http://localhost:8899"
-KEY_FILE = "~/.config/vm-bridge/api-key"  # on the VM, mode 600
+# On the VM, mode 600. This is the SAME file the vm-bridge-rs systemd
+# unit loads via EnvironmentFile (audit 42 High-6): the CLI must never
+# read a different key file than the server, or auth breaks confusingly.
+ENV_FILE = "~/.config/vm-bridge/env"  # on the VM
+# Back-compat alias (the pre-audit-42 name); prefer ENV_FILE.
+KEY_FILE = ENV_FILE
+
+
+def _key_header_fragment():
+    """Remote-shell fragment producing the X-API-Key header value.
+
+    Extracts the key from the unit's EnvironmentFile on the VM:
+    VM_BRIDGE_KEYS__ADMIN first (covers every scope), then the legacy
+    BRIDGE_API_KEY (accepted for all scopes). Values are trimmed of
+    whitespace/CR/LF on this side; the server trims again on its side.
+    The key is NEVER placed in argv — it stays inside the remote shell's
+    command substitution, so it never crosses SSH argv or lands in logs.
+    """
+    return (
+        '"X-API-Key: $(f=$HOME/.config/vm-bridge/env;'
+        "k=$(sed -n 's/^VM_BRIDGE_KEYS__ADMIN=//p' \"$f\"|head -n 1);"
+        "[ -z \"$k\" ]&&k=$(sed -n 's/^BRIDGE_API_KEY=//p' \"$f\"|head -n 1);"
+        "printf '%s' \"$k\"|tr -d ' \\t\\r\\n')\""
+    )
 
 
 def _inner(method, path, data=None, lease=None):
@@ -168,7 +194,11 @@ def _inner(method, path, data=None, lease=None):
         parts += ["--data-binary", "@-"]
     parts.append(BASE + path)
     cmd = " ".join(shlex.quote(p) for p in parts)
-    cmd += ' -H "X-API-Key: $(cat $HOME/.config/vm-bridge/api-key)"'
+    # The auth header is appended UNQUOTED on purpose: it needs $() and
+    # $HOME expansion on the VM. The key itself never appears here; the
+    # remote shell extracts it from the unit's EnvironmentFile
+    # (~/.config/vm-bridge/env, mode 600) via _key_header_fragment().
+    cmd += " -H " + _key_header_fragment()
     if body_b64 is not None:
         cmd = f"echo {body_b64} | base64 -d | {cmd}"
     return cmd
@@ -278,18 +308,21 @@ def main(argv):
             # Workday multiselect items.
             node, sel = _gemini_resolve("move mouse to", argv[2])
             if node:
-                # Get coordinates via CDP click_node (dry run to get position)
-                code2, body2 = api("POST", "/browser/click_node",
-                                   {"backendNodeId": node, **vis})
-                # click_node returns coordinates; we just want the position
-                # Fall back to selector-based move if needed
+                # Read-only locate via /browser/node_box (audit 42 High-7):
+                # move-ai must NEVER click. The old code used click_node as
+                # a "dry run to get position" — that dispatched a real click.
+                code2, body2 = api("POST", "/browser/node_box",
+                                   {"backendNodeId": node})
+                # node_box returns viewport coords; move_to_viewport takes
+                # viewport coords (the old code fed them to /browser/move_to,
+                # which expects absolute screen coords).
                 try:
                     d2 = json.loads(body2)
                     at = d2.get("at", {})
-                    if at.get("x"):
-                        # Use move_to with screen coords (approximate)
-                        code, body = api("POST", "/browser/move_to",
-                                         {"x": int(at["x"]), "y": int(at["y"])})
+                    if at.get("x") is not None and at.get("y") is not None:
+                        code, body = api("POST", "/browser/move_to_viewport",
+                                         {"x": float(at["x"]),
+                                          "y": float(at["y"])})
                     else:
                         code, body = 500, '{"ok":false,"error":"no-coords"}'
                 except Exception:
@@ -460,7 +493,7 @@ def main(argv):
             if sub == "acquire":
                 d = {}
                 if len(argv) > 3:
-                    d["client_id"] = argv[3]
+                    d["client"] = argv[3]
                 if len(argv) > 4:
                     d["ttl_s"] = int(argv[4])
                 code, body = api("POST", "/lease/acquire", d)
@@ -485,7 +518,9 @@ def main(argv):
             # body is raw PNG bytes? No: text mode mangled it. Re-fetch binary.
             sys.exit("shot: binary fetch not supported via text transport; "
                      "use cb-job.sh run 'curl -s localhost:8899/browser/screenshot -H "
-                     f"\"X-API-Key: $(cat {KEY_FILE})\" -o /tmp/shot.png' + cb-xfer pull")
+                     "\"X-API-Key: $(sed -n 's/^BRIDGE_API_KEY=//p' "
+                     "$HOME/.config/vm-bridge/env|head -n 1|tr -d ' \\t\\r\\n')\" "
+                     "-o /tmp/shot.png' + cb-xfer pull")
         elif c == "call":
             method, path = argv[2], argv[3]
             data = None

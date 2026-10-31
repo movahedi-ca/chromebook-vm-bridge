@@ -70,6 +70,15 @@ pub struct ApiKeys {
 
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
+        let mut cfg: Config = Self::build_base_config()?;
+        Self::resolve_key_layout(&mut cfg)?;
+        Self::check_bind_addr(&cfg)?;
+        Ok(cfg)
+    }
+
+    /// Assemble defaults, resolved paths, the optional TOML file, and
+    /// `VM_BRIDGE__*` env overrides into a deserialized `Config`.
+    fn build_base_config() -> anyhow::Result<Self> {
         let cfg_dir =
             dirs::config_dir().map_or_else(|| PathBuf::from("."), |d| d.join("vm-bridge"));
 
@@ -135,18 +144,50 @@ impl Config {
                 .try_parsing(true),
         );
 
-        let mut cfg: Config = builder.build()?.try_deserialize()?;
+        Ok(builder.build()?.try_deserialize::<Config>()?)
+    }
 
-        // Single-key fallback: if the scoped keys are unset, accept the
-        // legacy BRIDGE_API_KEY value for all three scopes. This makes the
-        // Rust bridge a drop-in replacement for existing clients that send
-        // one X-API-Key for everything — no client changes needed.
-        // (Operators who want real scope separation set the three
-        // VM_BRIDGE_KEYS__* values instead; those take precedence.)
-        if cfg.keys.read.trim().is_empty()
+    /// Resolve the API-key layout (audit 42 Medium-8): reject mixed
+    /// provenance, fall back to `BRIDGE_API_KEY` only when no scoped key is
+    /// set, and refuse missing or weak (< 32 char) keys at startup.
+    fn resolve_key_layout(cfg: &mut Config) -> anyhow::Result<()> {
+        // If the operator sets ANY scoped key, the
+        // legacy BRIDGE_API_KEY must NOT silently fill the other scopes.
+        // Mixed provenance is a misconfiguration (one scope strong, two
+        // scopes accidentally sharing the legacy key) — fail startup and
+        // say so, instead of running with a key layout nobody asked for.
+        let scoped_env = [
+            "VM_BRIDGE_KEYS__READ",
+            "VM_BRIDGE_KEYS__ACT",
+            "VM_BRIDGE_KEYS__ADMIN",
+        ];
+        let any_scoped = scoped_env
+            .iter()
+            .any(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()));
+        if any_scoped {
+            for (env_name, key) in [
+                ("VM_BRIDGE_KEYS__READ", cfg.keys.read.trim()),
+                ("VM_BRIDGE_KEYS__ACT", cfg.keys.act.trim()),
+                ("VM_BRIDGE_KEYS__ADMIN", cfg.keys.admin.trim()),
+            ] {
+                if key.is_empty() {
+                    anyhow::bail!(
+                        "{env_name} is unset while other VM_BRIDGE_KEYS__* are set — \
+                         refusing to fill it from BRIDGE_API_KEY (audit 42 Medium-8). \
+                         Set all three scoped keys explicitly."
+                    );
+                }
+            }
+        } else if cfg.keys.read.trim().is_empty()
             || cfg.keys.act.trim().is_empty()
             || cfg.keys.admin.trim().is_empty()
         {
+            // Single-key fallback: if the scoped keys are unset, accept the
+            // legacy BRIDGE_API_KEY value for all three scopes. This makes the
+            // Rust bridge a drop-in replacement for existing clients that send
+            // one X-API-Key for everything — no client changes needed.
+            // (Operators who want real scope separation set the three
+            // VM_BRIDGE_KEYS__* values instead; those take precedence.)
             if let Ok(legacy) = std::env::var("BRIDGE_API_KEY") {
                 let legacy = legacy.trim().to_string();
                 // legacy is fanned out to three independent scope keys; the clones are necessary.
@@ -166,7 +207,11 @@ impl Config {
             }
         }
 
-        // Fail fast on missing keys (audit SEC-4)
+        // Fail fast on missing keys (audit SEC-4), and on weak keys
+        // (audit 42 Medium-8): anything under 32 chars is refused at
+        // startup instead of running with a guessable bearer token.
+        // (The production key was length-verified before this bail was
+        // enforced; a shorter key fails loudly here rather than silently.)
         for (name, key) in [
             ("read", &cfg.keys.read),
             ("act", &cfg.keys.act),
@@ -178,11 +223,32 @@ impl Config {
                     name.to_uppercase()
                 );
             }
-            if key.len() < 32 {
-                tracing::warn!("API key '{}' is shorter than 32 chars", name);
+            if key.trim().len() < 32 {
+                anyhow::bail!(
+                    "API key '{name}' is shorter than 32 chars — refusing to start (audit 42 Medium-8)"
+                );
             }
         }
 
-        Ok(cfg)
+        Ok(())
+    }
+
+    /// Fail closed on a non-loopback bind address (audit 42 Medium-7).
+    /// The bridge speaks plain HTTP and its API keys are bearer tokens;
+    /// binding 0.0.0.0 by accident would expose it to the whole LAN.
+    /// Override explicitly with `VM_BRIDGE_ALLOW_NON_LOOPBACK=1` only.
+    fn check_bind_addr(cfg: &Config) -> anyhow::Result<()> {
+        let bind = cfg.bind_addr.trim().to_lowercase();
+        let is_loopback = bind == "127.0.0.1" || bind == "::1" || bind == "localhost";
+        let non_loopback_allowed =
+            std::env::var("VM_BRIDGE_ALLOW_NON_LOOPBACK").is_ok_and(|v| v.trim() == "1");
+        if !is_loopback && !non_loopback_allowed {
+            anyhow::bail!(
+                "bind_addr '{bind}' is not loopback — refusing to start (audit 42 Medium-7). \
+                 Set VM_BRIDGE_ALLOW_NON_LOOPBACK=1 to override explicitly."
+            );
+        }
+
+        Ok(())
     }
 }

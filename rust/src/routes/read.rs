@@ -102,9 +102,15 @@ pub async fn text(State(state): State<SharedState>) -> impl IntoResponse {
         Err(e) => return bad_gateway(format!("evaluate text: {e}")),
     };
     let text: String = v.as_str().unwrap_or("").chars().take(12000).collect();
+    // Audit 42 High-5: PII/secret redaction on the way out. READ-scope
+    // callers must not receive raw credential/token values scraped from
+    // the page.
+    let (text, redactions) = crate::privy::redact(&text);
     (
         StatusCode::OK,
-        Json(json!({"ok": true, "url": url, "title": title, "text": text})),
+        Json(
+            json!({"ok": true, "url": url, "title": title, "text": text, "redactions": redactions}),
+        ),
     )
         .into_response()
 }
@@ -121,9 +127,12 @@ pub async fn html(State(state): State<SharedState>) -> impl IntoResponse {
         Err(e) => return bad_gateway(format!("evaluate html: {e}")),
     };
     let html: String = v.as_str().unwrap_or("").chars().take(20000).collect();
+    // Audit 42 High-5: redact secrets from markup too (inline scripts and
+    // hidden inputs often carry tokens).
+    let (html, redactions) = crate::privy::redact(&html);
     (
         StatusCode::OK,
-        Json(json!({"ok": true, "url": url, "html": html})),
+        Json(json!({"ok": true, "url": url, "html": html, "redactions": redactions})),
     )
         .into_response()
 }
@@ -150,7 +159,15 @@ pub async fn snapshot(State(state): State<SharedState>) -> impl IntoResponse {
                 role = t === 'checkbox' ? 'checkbox' : t === 'radio' ? 'radio' : t === 'range' ? 'slider' : 'textbox';
             }
             if (tag === 'textarea' || tag === 'select') role = 'textbox';
-            const name = (el.getAttribute('aria-label') || el.innerText || el.value || '').trim().slice(0, 80);
+            // Audit 42 High-5: NEVER surface secret-classified field values.
+            // The old code folded el.value into the name for every input —
+            // passwords included — so credential values reached READ-scope
+            // callers in the snapshot. Password and hidden inputs contribute
+            // no value here at all.
+            const t = (el.getAttribute('type') || '').toLowerCase();
+            const secretField = tag === 'input' && (t === 'password' || t === 'hidden');
+            const val = secretField ? '' : (el.value || '');
+            const name = (el.getAttribute('aria-label') || el.innerText || val || '').trim().slice(0, 80);
             return [role, name];
         });
     })()"#;
@@ -390,7 +407,23 @@ pub async fn tab_new(
         Ok(Err(e)) => return bad_gateway(format!("new_page: {e}")),
         Err(_) => return bad_gateway("new_page timed out"),
     };
+    // Defense in depth: literal-IP block patterns on the new target
+    // (audit 42 High-1). Best-effort; the Rust firewall is the primary gate.
+    crate::browser::actions::install_blocked_url_patterns(&page).await;
     let (url, title) = page_url_title(&page).await;
+    // Re-run the SSRF firewall on the LANDED url (audit 42 High-1):
+    // target creation navigates, and redirects can land where the
+    // firewall would have refused. Fail closed: close the page and
+    // refuse, never register a tab on a blocked landing.
+    if let Err(e) = crate::privy::validate_navigate_url(&url, &[]).await {
+        tracing::warn!(url, error = %e, "tab_new landed URL failed SSRF re-check; closing tab");
+        let _ = page.close().await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": format!("landed URL blocked: {e}"), "verified": false})),
+        )
+            .into_response();
+    }
     let id = uuid::Uuid::new_v4().to_string();
     let page = Arc::new(page);
     let evicted = {

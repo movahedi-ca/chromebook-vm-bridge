@@ -15,8 +15,17 @@ use std::path::Path;
 use std::sync::Mutex;
 
 /// JS installed on every new document. Captures change/blur on inputs,
-/// textareas, selects, and ARIA comboboxes/listboxes. POSTs back to
-/// the bridge via fetch to /internal/checkpoint (internal only).
+/// textareas, selects, and ARIA comboboxes/listboxes.
+///
+/// DISABLED (see browser/tabs.rs): there is no /internal/checkpoint route.
+/// Do NOT enable this as written (audit 42 Medium): `fetch('/internal/checkpoint')`
+/// is a RELATIVE url, so from page JS it posts field values to the PAGE'S
+/// ORIGIN (e.g. <https://example.com/internal/checkpoint>) — not to the
+/// bridge. The old docstring claiming it posts "back to the bridge" was
+/// wrong. Before this is ever enabled, the capture must return the payload
+/// to Rust (via CDP evaluate) and let the BRIDGE server-side decide what
+/// to persist — page JS must never be trusted to exfiltrate field values,
+/// even to "internal" paths.
 pub const FORMGUARD_JS: &str = r#"
 (function() {
   if (window.__formguard_installed) return;

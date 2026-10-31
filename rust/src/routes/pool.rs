@@ -125,6 +125,20 @@ async fn pool_page(state: &SharedState, id: &str) -> Result<Arc<Page>, Response>
     }
 }
 
+/// Best-effort disposal of a pool browser context (audit 42 High-3).
+/// A missing id or a dead browser just logs; the context dies with the
+/// browser anyway. Disposal is what wipes the context's cookies,
+/// localStorage, and cache — closing the page alone does not.
+async fn dispose_pool_context(browser: &chromiumoxide::Browser, ctx_id: Option<String>) {
+    let Some(id) = ctx_id else {
+        return;
+    };
+    let ctx = chromiumoxide::cdp::browser_protocol::browser::BrowserContextId::new(id);
+    if let Err(e) = browser.dispose_browser_context(ctx).await {
+        tracing::debug!(error = %e, "pool browser-context dispose failed (best-effort)");
+    }
+}
+
 // ---------- handlers ----------
 
 /// POST /pool/acquire {`ttl_s`, trace} -> {"`ok":true,"context_id`"}
@@ -141,20 +155,42 @@ pub async fn acquire(
             None => return err503("browser not connected"),
         }
     };
-    // Open the page BEFORE taking the pool lock: new_page is a slow CDP
-    // round-trip and the lock is never held across it (audit 40 MED-4).
-    let page = match browser.new_page("about:blank").await {
-        Ok(p) => Arc::new(p),
-        Err(e) => return err503(format!("pool new_page: {e}")),
+    // Disposable browser context per acquire (audit 42 High-3): the pool
+    // page runs in its own cookie jar / storage / cache — NEVER in the
+    // default context alongside the signed-in profile. Disposed on
+    // release/eviction. CDP round-trips happen BEFORE taking the pool
+    // lock: the lock is never held across them (audit 40 MED-4).
+    let ctx_id = match browser
+        .create_browser_context(
+            chromiumoxide::cdp::browser_protocol::target::CreateBrowserContextParams::default(),
+        )
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => return err503(format!("pool create_browser_context: {e}")),
     };
+    let mut target_params =
+        chromiumoxide::cdp::browser_protocol::target::CreateTargetParams::new("about:blank");
+    target_params.browser_context_id = Some(ctx_id.clone());
+    let page = match browser.new_page(target_params).await {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            // Don't leak the context when the page fails to open.
+            let _ = browser.dispose_browser_context(ctx_id).await;
+            return err503(format!("pool new_page: {e}"));
+        }
+    };
+    // Literal-IP block patterns on the new target (audit 42 High-1).
+    crate::browser::actions::install_blocked_url_patterns(&page).await;
     let (id, to_close) = {
         let mut pool = state.pool.lock().await;
         let to_close = pool.prepare_acquire();
-        let id = pool.register(page, req.ttl_s, req.trace);
+        let id = pool.register(page, ctx_id.inner().clone(), req.ttl_s, req.trace);
         (id, to_close)
     };
-    for p in to_close {
+    for (p, c) in to_close {
         close_page(&p).await;
+        dispose_pool_context(&browser, c).await;
     }
     Json(json!({"ok": true, "context_id": id})).into_response()
 }
@@ -164,13 +200,22 @@ pub async fn release(
     State(state): State<SharedState>,
     Json(req): Json<ContextIdReq>,
 ) -> impl IntoResponse {
-    let page = {
+    let browser = {
+        let b = state.browser1.lock().await;
+        b.browser()
+    };
+    let released = {
         let mut pool = state.pool.lock().await;
         pool.release(&req.context_id)
     };
-    match page {
-        Some(p) => {
+    match released {
+        Some((p, ctx)) => {
             close_page(&p).await;
+            // Dispose the browser context so its cookies, storage, and
+            // cache die with it (audit 42 High-3).
+            if let Some(b) = browser {
+                dispose_pool_context(&b, ctx).await;
+            }
             Json(json!({"ok": true})).into_response()
         }
         None => (
@@ -198,10 +243,22 @@ pub async fn navigate(
     let nav =
         tokio::time::timeout(Duration::from_secs(30), page.goto(validated_url.as_str())).await;
     match nav {
-        Ok(Ok(_)) => match page.url().await {
-            Ok(url) => Json(json!({"ok": true, "url": url.unwrap_or_default()})).into_response(),
-            Err(e) => err500(format!("navigate url read: {e}")),
-        },
+        Ok(Ok(_)) => {
+            let landed = page.url().await.ok().flatten().unwrap_or_default();
+            // Re-run the SSRF firewall on the LANDED url (audit 42 High-1).
+            // Fail closed: never report success on a blocked landing.
+            match crate::privy::validate_navigate_url(&landed, &[]).await {
+                Ok(_) => Json(json!({"ok": true, "url": landed, "verified": true})).into_response(),
+                Err(e) => {
+                    tracing::warn!(context_id = %req.context_id, landed, error = %e, "pool landed URL failed SSRF re-check");
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"ok": false, "error": format!("landed URL blocked: {e}"), "url": landed, "verified": false})),
+                    )
+                        .into_response()
+                }
+            }
+        }
         Ok(Err(e)) => err500(format!("navigate failed: {e}")),
         Err(_) => err500("navigate timed out after 30s"),
     }
@@ -473,7 +530,11 @@ pub async fn text(
 
 /// GET /pool/status -> {"ok":true,"contexts":N,"max":3,"browser":bool}
 pub async fn status(State(state): State<SharedState>) -> impl IntoResponse {
-    let (pruned, contexts, max, browser) = {
+    let browser = {
+        let b = state.browser1.lock().await;
+        b.browser()
+    };
+    let (pruned, contexts, max, browser_up) = {
         let mut pool = state.pool.lock().await;
         let pruned = pool.prune();
         (
@@ -483,14 +544,19 @@ pub async fn status(State(state): State<SharedState>) -> impl IntoResponse {
             PoolState::is_browser_connected(),
         )
     };
-    for p in pruned {
+    for (p, c) in pruned {
         close_page(&p).await;
+        // TTL-expired contexts are disposed too: their cookie jars must
+        // not outlive them (audit 42 High-3).
+        if let Some(b) = browser.as_ref() {
+            dispose_pool_context(b, c).await;
+        }
     }
     Json(json!({
         "ok": true,
         "contexts": contexts,
         "max": max,
-        "browser": browser,
+        "browser": browser_up,
     }))
     .into_response()
 }

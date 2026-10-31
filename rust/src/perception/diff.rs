@@ -196,7 +196,6 @@ pub const DIFF_FLUSH_JS: &str = r#"(() => {
 mod tests {
     use super::*;
 
-    #[allow(clippy::assert_is_empty)] // is_empty() is clearer than assert_eq! against an empty array literal
     #[test]
     fn deserialize_full_diff() {
         let json = r##"{

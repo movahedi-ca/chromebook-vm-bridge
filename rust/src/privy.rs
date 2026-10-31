@@ -38,10 +38,8 @@ pub const SANITIZE_JS: &str = r"
 })();
 ";
 
-#[allow(dead_code)] // parked: PII redactor not yet wired into any route (audit LOW-1)
 static PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
 
-#[allow(dead_code)] // parked: PII redactor not yet wired into any route (audit LOW-1)
 fn patterns() -> &'static Vec<(Regex, &'static str)> {
     // Static regexes: expect, not unwrap — a broken pattern is a
     // programming bug and must fail loudly at first use, with a
@@ -78,7 +76,8 @@ fn patterns() -> &'static Vec<(Regex, &'static str)> {
 }
 
 /// Redact PII/secrets from text. Returns (`redacted_text`, `redaction_count`).
-#[allow(dead_code)] // parked: PII redactor not yet wired into any route (audit LOW-1)
+/// Wired into /browser/text, /browser/html, and eval string results
+/// (audit 42 High-5).
 pub fn redact(text: &str) -> (String, usize) {
     let mut out = text.to_string();
     let mut count = 0;
@@ -157,11 +156,13 @@ pub async fn validate_navigate_url(raw: &str, allowlist: &[String]) -> Result<ur
     }
 }
 
-/// Normalize IPv4-mapped IPv6 (`::ffff:10.0.0.1`) to plain IPv4 so the
-/// blocklist below can't be bypassed with a mapped address (audit MED-2).
+/// Normalize IPv4-mapped (`::ffff:10.0.0.1`) and IPv4-compatible
+/// (`::10.0.0.1`) IPv6 addresses to plain IPv4 so the blocklist below
+/// can't be bypassed with a mapped/compatible address (audit MED-2,
+/// audit 42 High-1).
 fn normalize(ip: std::net::IpAddr) -> std::net::IpAddr {
     if let std::net::IpAddr::V6(v6) = ip {
-        if let Some(v4) = v6.to_ipv4_mapped() {
+        if let Some(v4) = v6.to_ipv4() {
             return std::net::IpAddr::V4(v4);
         }
     }
@@ -172,20 +173,32 @@ fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
     let ip = normalize(*ip);
     match ip {
         std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
             v4.is_loopback() || v4.is_link_local() || v4.is_private()
-            || v4.is_unspecified() || v4.is_multicast()
+            // 0.0.0.0/8 ("this network"): is_unspecified() covers only
+            // 0.0.0.0 itself — the whole /8 must be blocked (audit 42
+            // High-1). Chrome treats 0.x as "unspecified-ish" and it can
+            // reach local listeners on some stacks.
+            || o[0] == 0
+            || v4.is_broadcast()
+            || v4.is_multicast()
             // 169.254.169.254 (cloud metadata) is link-local → blocked
             // 100.64.0.0/10 (CGNAT) — check manually
-            || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b11_000000) == 0b01_000000)
+            || (o[0] == 100 && (o[1] & 0b11_000000) == 0b01_000000)
         }
         std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
             v6.is_loopback()
                 || v6.is_unicast_link_local()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 // fc00::/7 unique-local — the IPv6 analog of RFC1918
                 // (audit 40 MED-1)
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xfe00) == 0xfc00
+                // 2002::/16 6to4: the first 16 bits are 0x2002 and the
+                // next 32 embed an IPv4 address that can itself be
+                // private/loopback (audit 42 High-1)
+                || s[0] == 0x2002
         }
     }
 }
@@ -236,6 +249,29 @@ mod tests {
         assert!(is_blocked_ip(&"fd00::1".parse().unwrap()));
         assert!(is_blocked_ip(&"fc12:3456::1".parse().unwrap()));
         assert!(!is_blocked_ip(&"2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn blocks_zero_net_and_broadcast() {
+        // 0.0.0.0/8: is_unspecified() alone covers only 0.0.0.0
+        // (audit 42 High-1)
+        assert!(is_blocked_ip(&"0.0.0.0".parse().unwrap()));
+        assert!(is_blocked_ip(&"0.0.0.1".parse().unwrap()));
+        assert!(is_blocked_ip(&"0.1.2.3".parse().unwrap()));
+        assert!(is_blocked_ip(&"255.255.255.255".parse().unwrap()));
+        assert!(!is_blocked_ip(&"1.1.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn blocks_6to4_and_compat() {
+        // 2002::/16 6to4 embeds an IPv4 address (audit 42 High-1)
+        assert!(is_blocked_ip(&"2002:7f00:1::1".parse().unwrap()));
+        // ::ffff:127.0.0.1 (mapped) and ::127.0.0.1 (compatible) both
+        // normalize to IPv4 loopback
+        assert!(is_blocked_ip(&"::ffff:127.0.0.1".parse().unwrap()));
+        assert!(is_blocked_ip(&"::127.0.0.1".parse().unwrap()));
+        assert!(is_blocked_ip(&"::ffff:10.0.0.1".parse().unwrap()));
+        assert!(!is_blocked_ip(&"::ffff:1.1.1.1".parse().unwrap()));
     }
 
     #[test]

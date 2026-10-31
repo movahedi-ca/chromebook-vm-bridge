@@ -66,7 +66,9 @@ return guidance errors pointing at the equivalent HTTP endpoints.
 2. Set `BRIDGE_API_KEY` in `~/.config/vm-bridge/env` (mode 600; see the systemd
    unit's `EnvironmentFile`; never hardcode it).
 3. Copy your Chrome profile to the configured profile dir so signed-in
-   sessions are available.
+   sessions are available — but NEVER copy `Login Data` / `Login Data-journal`
+   (audit 42 Medium-13): with `--password-store=basic` those are plaintext
+   SQLite files, and the bridge host must not hold your saved passwords.
 4. Install the systemd unit: copy `rust/systemd/vm-bridge-rs.service` to
    `~/.config/systemd/user/`, then `systemctl --user enable --now vm-bridge-rs.service`.
 
@@ -88,3 +90,13 @@ Every request carries `X-API-Key: <key>`, except `/health`.
   zone could serve a benign IP to the check and a private IP to Chrome.
   Accepted for a single-operator bridge; do not point the bridge at
   untrusted DNS.
+- Residual risk, ACCEPTED (audit 42 High-8): `agent/cb-job.sh run/bg` is an
+  unsandboxed remote shell running as the VM user `auto`, which holds
+  passwordless sudo — any delegated agent with bridge access can read the
+  Chrome profile, the bridge env file, and escalate via sudo. The proper fix
+  (a dedicated no-sudo automation user plus a fixed command dispatcher)
+  would rebuild the automation workflow itself: every build, deploy, and
+  school check runs through `cb-job.sh`, so the dispatcher change is a
+  workflow rewrite, not a patch. Accepted for now because the operator is
+  the only delegator and the alternative breaks daily operations; revisit
+  the moment a second, less-trusted party can delegate work to this box.
