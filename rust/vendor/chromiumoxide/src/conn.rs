@@ -150,13 +150,26 @@ impl<T: EventMessage + Unpin> Stream for Connection<T> {
                         // drift, e.g. Chrome 156 renaming
                         // ClientSecurityState.privateNetworkRequestPolicy to
                         // localNetworkAccessRequestPolicy) must NOT kill the whole
-                        // connection. Log it loudly and skip it; the stream lives on.
-                        // The bridge does not consume Network-domain events, so
-                        // dropping the occasional drifted event is safe.
+                        // connection. Distinguish CDP *events* (no "id": safe to
+                        // drop) from *responses* (dropping one would hang its
+                        // pending call until the 30s command eviction — audit
+                        // HIGH-5). An unparseable response fails the stream so the
+                        // pending oneshot resolves with an error and the
+                        // supervisor relaunches the browser; the HTTP TimeoutLayer
+                        // bounds the request either way.
+                        let is_event = serde_json::from_str::<serde_json::Value>(&text)
+                            .ok()
+                            .and_then(|v| v.get("id").cloned())
+                            .is_none();
+                        if is_event {
+                            let preview: String = text.chars().take(300).collect();
+                            tracing::warn!("Skipping unparseable WS event (protocol drift): {} | msg={}", err, preview);
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
                         let preview: String = text.chars().take(300).collect();
-                        tracing::warn!("Skipping unparseable WS message (protocol drift): {} | msg={}", err, preview);
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
+                        tracing::error!("Unparseable CDP response (has id), failing stream: {} | msg={}", err, preview);
+                        return Poll::Ready(Some(Err(CdpError::Serde(err))));
                     }
                 };
                 Poll::Ready(Some(ready))
