@@ -34,8 +34,8 @@ export GEMINI_BIN="$HOME/bin/gemini_generate.py"  # enables order-smart / move-a
 3. Pin the VM's host key: `CB_PINNED_HOSTS` defaults to
    `~/.ssh/known_hosts.d/chromebook-vm-pinned`. Capture it from the live
    server once; a changed key fails loudly (possible MITM).
-   it on the VM from `~/.config/vm-bridge/api-key` (mode 600), so the key
-   never crosses SSH argv and never appears in logs.
+4. The bridge reads its API key on the VM from `~/.config/vm-bridge/env`
+   (mode 600), so the key never crosses SSH argv and never appears in logs.
 
 ## Design notes
 
@@ -45,4 +45,5 @@ export GEMINI_BIN="$HOME/bin/gemini_generate.py"  # enables order-smart / move-a
   retries transient network errors.
 - Killing the local SSH wrapper does **not** stop the remote process. Use
   `cb-job.sh kill` (process-group kill on the VM) for background jobs.
-  file transfer (`cb-xfer.sh pull`), not through the text transport.
+- Large artifacts move via file transfer (`cb-xfer.sh pull`), not through
+  the text transport.
