@@ -136,7 +136,7 @@ case "$cmd" in
     # shellcheck disable=SC2029
     # set -e would abort on a non-zero remote exit before rc=$? runs
     # (audit MED-3); the if/else form is exempt from set -e.
-    if $SSH "~/jobs/activity-set.sh working 'run' '$cmd_short'; echo $b64 | base64 -d | timeout 600 bash > /tmp/cb-run.out 2>&1; rc=\$?; cat /tmp/cb-run.out; rm -f /tmp/cb-run.out; ~/jobs/activity-set.sh idle 'run done' >/dev/null 2>&1 || true; exit \$rc"; then
+    if $SSH "_tmp=\$(mktemp /tmp/cb-run.XXXXXX) || exit 96; chmod 600 \"\$_tmp\"; ~/jobs/activity-set.sh working 'run' '$cmd_short'; echo $b64 | base64 -d | timeout 600 bash > \"\$_tmp\" 2>&1; rc=\$?; cat \"\$_tmp\"; rm -f \"\$_tmp\"; ~/jobs/activity-set.sh idle 'run done' >/dev/null 2>&1 || true; exit \$rc"; then
       rc=0
     else
       rc=$?
