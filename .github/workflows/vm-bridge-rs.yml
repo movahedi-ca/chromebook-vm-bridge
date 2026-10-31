@@ -41,8 +41,19 @@ jobs:
 
       - name: Security audit
         run: |
-          cargo install --locked cargo-audit
+          # Pinned: reproducible tool version, bumped deliberately
+          # (audit 41 LOW-7).
+          cargo install --locked cargo-audit --version 0.22.2
           cargo audit
+          # Vendored chromiumoxide (audit 41 LOW-13): re-evaluate the
+          # vendor/chromiumoxide-conn.patch on every upstream release.
+          # This step fails when a newer 0.7.x exists, prompting a re-base.
+          LATEST=$(curl -fsSL --max-time 20 https://crates.io/api/v1/crates/chromiumoxide | python3 -c "import json,sys; print(json.load(sys.stdin)['crate']['max_version'])")
+          echo "upstream chromiumoxide: $LATEST (vendored: 0.7.0)"
+          case "$LATEST" in
+            0.7.0) echo "vendored patch is current" ;;
+            *) echo "::error::chromiumoxide $LATEST released upstream — re-base vendor/chromiumoxide-conn.patch"; exit 1 ;;
+          esac
 
   # Contract tests need a live Chrome + X11, so they run on the VM, not in
   # CI. (There is no rust/tests/ or scripts/run-contract-tests.sh in this
@@ -55,7 +66,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: ShellCheck agent scripts
-        uses: ludeeus/action-shellcheck@master
+        # Pinned to the v2.0.0 commit SHA, not @master (audit 41 LOW-7):
+        # @master is a mutable ref and would silently change CI behavior.
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38
         with:
           scandir: './agent'
           severity: warning
