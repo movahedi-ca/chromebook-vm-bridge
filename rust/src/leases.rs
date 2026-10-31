@@ -1,7 +1,7 @@
 //! Lease management (audit SEC-7).
 //!
 //! Fixes vs. the legacy implementation:
-//! - `GET /lease/status` NEVER returns the lease_id (was hijackable)
+//! - `GET /lease/status` NEVER returns the `lease_id` (was hijackable)
 //! - `acquire` returns the CLAMPED ttl (was returning unclamped request)
 //! - `POST /lease/renew` exists
 //! - TTL clamped to [10, 3600]
@@ -34,7 +34,7 @@ impl LeaseTable {
         }
     }
 
-    /// Acquire a lease. Returns (lease_id, clamped_ttl_s).
+    /// Acquire a lease. Returns (`lease_id`, `clamped_ttl_s`).
     /// Only one active lease at a time; second acquire gets 423.
     pub fn acquire(
         &mut self,
@@ -85,18 +85,19 @@ impl LeaseTable {
         !self.leases.is_empty()
     }
 
-    /// Status for GET /lease/status — lease_id REDACTED (audit SEC-7).
-    pub fn status(&mut self) -> LeaseStatus {
+    /// Public status projection for GET /lease/status: the holder's client
+    /// name is deliberately NOT included (audit 41 MED-8). The name is
+    /// untrusted self-chosen input and a user-activity oracle; only the
+    /// bridge itself sees it (server-side logs).
+    pub fn status_public(&mut self) -> LeaseStatusPublic {
         self.prune_expired();
         match self.leases.values().next() {
-            Some(l) => LeaseStatus {
+            Some(l) => LeaseStatusPublic {
                 locked: true,
-                client: Some(l.client.clone()),
                 ttl_left_s: (l.expires_at - Utc::now()).num_seconds().max(0),
             },
-            None => LeaseStatus {
+            None => LeaseStatusPublic {
                 locked: false,
-                client: None,
                 ttl_left_s: 0,
             },
         }
@@ -114,10 +115,14 @@ impl Default for LeaseTable {
     }
 }
 
+/// Public view of a lease for GET /lease/status: the holder's client name
+/// is deliberately NOT included. The name is untrusted self-chosen input
+/// and a user-activity oracle ("is the operator active right now?"); the
+/// module's design note has always said it must not be surfaced, but the
+/// route used to serialize the full struct (audit 41 MED-8).
 #[derive(Debug, Serialize)]
-pub struct LeaseStatus {
+pub struct LeaseStatusPublic {
     pub locked: bool,
-    pub client: Option<String>,
     #[serde(rename = "ttl_left_s")]
     pub ttl_left_s: i64,
 }
