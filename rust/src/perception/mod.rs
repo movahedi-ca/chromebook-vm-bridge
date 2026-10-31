@@ -2,7 +2,7 @@
 //!
 //! Fixes vs. the legacy implementation (audit M3): the old `_ax_snapshot` filter,
 //! `role in interesting or (name and role)`, was effectively a no-op.
-//! Nearly every named DOM node (StaticText, generic, paragraph, image)
+//! Nearly every named DOM node (`StaticText`, generic, paragraph, image)
 //! satisfied it, so the 200-node cap filled with static header and body
 //! text in document order before reaching interactive buttons or inputs.
 //! This module filters STRICTLY to interactive/form roles plus headings
@@ -160,7 +160,7 @@ impl AxMapper {
 /// - Accessible name order: `aria-labelledby`, `aria-label`, associated
 ///   `<label>`, text content, then `placeholder`/`title`/`alt`/`value`.
 #[allow(dead_code)] // parked: JS snapshot path superseded by the Rust AX walker (audit LOW-1)
-pub const AX_SNAPSHOT_JS: &str = r##"(() => {
+pub const AX_SNAPSHOT_JS: &str = r#"(() => {
   const CAP = 200;
   // Mirrors perception::filter_interactive (Rust). Keep in sync.
   const INTERACTIVE = new Set([
@@ -287,7 +287,7 @@ pub const AX_SNAPSHOT_JS: &str = r##"(() => {
     }
   }
   return { nodes: nodes, truncated: truncated };
-})()"##;
+})()"#;
 
 #[cfg(test)]
 mod tests {
