@@ -95,6 +95,12 @@ die() { # code message
 audit_log() { # code attempts dur_ms
   local code="$1" attempt="$2" dur="$3"
   local sub="${CB_AUDIT_CMD:-ssh-direct}" preview ts
+  # Fail loudly if the audit dir is missing (audit 40 MED-10): silently
+  # dropping the security-relevant audit trail is worse than noise.
+  if [ ! -d "$(dirname "$CB_AUDIT_LOG")" ]; then
+    echo "cb-ssh: audit dir missing: $(dirname "$CB_AUDIT_LOG")" >&2
+    return 1
+  fi
   preview="$(printf '%s' "$REMOTE_PREVIEW" | tr '\n\r' '  ' | cut -c1-60)"
   ts="$(date +%Y-%m-%dT%H:%M:%S%z)"
   {
@@ -223,6 +229,10 @@ _kperm="$(stat -c %a "$CB_KEY" 2>/dev/null || echo ?)"
 mkdir -p "$CB_CM_DIR" 2>/dev/null
 chmod 700 "$CB_CM_DIR" 2>/dev/null
 [ -d "$CB_CM_DIR" ] || { audit_log "$E_MUXDIR" 0 0; die "$E_MUXDIR" "control socket dir unusable: $CB_CM_DIR"; }
+
+# Audit trail dir (audit 40 MED-10): created alongside the control dir so
+# audit lines never silently vanish on a fresh machine.
+mkdir -p "$(dirname "$CB_AUDIT_LOG")" 2>/dev/null
 
 SSH_BASE=(ssh -i "$CB_KEY"
   -o BatchMode=yes -o ConnectTimeout=20
