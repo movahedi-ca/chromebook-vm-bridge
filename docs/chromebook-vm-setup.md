@@ -24,32 +24,45 @@ No secrets live in this repo: the API key is deployed out-of-band (see
 
 ## Display and browser
 
-- Xorg runs headed on **display `:1`**. The bridge drives a headed Google
-  Chrome on `:1` against a **copy of the main Chrome profile** (re-sync the
-  copy after any new login, otherwise sessions go stale).
+- Xorg runs headed on **display `:1`**. The bridge **spawns and supervises
+  its own headed Chrome** on `:1` — there is no externally-launched browser
+  and no separate Chrome keeper unit. One daemon owns the whole stack: if
+  Chrome exits, the bridge relaunches it with capped backoff and reconnects,
+  no manual step.
+- The browser runs against a **dedicated automation profile**
+  (`~/.config/chrome-automation`), seeded once from the main profile copy so
+  signed-in sessions persist. Re-sync the seed after any new login,
+  otherwise sessions go stale. The bridge never touches the main profile.
+- The spawn/supervise layer is a **swappable backend** behind a
+  `BrowserBackend` trait (launch, health check, kill, CDP URL); Chrome is
+  the first implementation. A future engine plugs in as a second backend
+  without touching routes, auth, or supervision.
+- Chrome launches locked-down: no `--no-sandbox`, full site isolation,
+  `--disable-dev-shm-usage`, `--password-store=basic`, window pinned to
+  `1920x1080` at `0,0`, remote-debugging port `9222`.
 - Remote viewing: TigerVNC on `5901` (display `:1`), plus noVNC services for
   browser-based viewing.
 - Physical-screen mirror: an x11vnc feed on `localhost:5902` mirrors `:1`
   onto the Chromebook's own display (`:0`), so automation is always visible
   on the device. An always-on-top activity panel announces background work.
 - Rule: never terminate Chrome remotely. Close/open tabs, keep the browser
-  process alive.
+  process alive. (If the bridge's own Chrome dies, the supervisor handles
+  it — do not relaunch it by hand.)
 
 ## Systemd services (user-level, `~/.config/systemd/user/`)
 
 | Unit | Purpose |
 |---|---|
-| `vm-bridge-rs.service` | The bridge: Rust binary on `localhost:8899`. `Type=notify` with `WatchdogSec=60`, `Restart=on-failure`, `MemoryMax=4G`, `DISPLAY=:1`. API key via `EnvironmentFile`. |
-| `main-chrome.service` | Keeps the headed Chrome alive on `:1`. |
+| `vm-bridge-rs.service` | The Rust bridge on `localhost:8899`. Spawns and supervises its own headed Chrome (no external browser). `Restart=on-failure`, `DISPLAY=:1`, `RUST_LOG=info`. API key via `EnvironmentFile`. |
 | `vnc.service`, `novnc.service`, `novnc-kiosk.service` | Remote desktop viewing. |
 | `mirror-feed.service`, `mirror-display.service` | Physical-screen mirror of `:1`. |
 | `caddy.service`, `funnel.service` | Local reverse-proxy/tunnel helpers. Agents never use the public tunnel URL. |
 
 ## `~/jobs` layout
 
-- `vm-bridge-rs/` — Rust bridge build tree (see `rust/` in this repo).
-  The live server on `:8899` via the `vm-bridge-rs` systemd unit.
-- `vm-bridge/` — retained as a rollback target (not live).
+- `vm-bridge-rs/` — live Rust bridge build tree (see `rust/` in this repo).
+  The `vm-bridge-rs` systemd unit runs it on `:8899`; it spawns and
+  supervises its own Chrome.
 - `fetch.py` — static page fetcher (curl with Chrome TLS impersonation),
   fenced with responsible-use rules: denylist, robots.txt honored,
   per-host rate limiting, audit log.
@@ -91,9 +104,13 @@ screenshots) are transferred as files, never parsed as text.
    `/browser/script`) are token-bucket limited (1 token per 3s, burst 5).
    "Max speed" automation is throttled by this, not by the client.
 
-## The bridge
+## Rust bridge
 
-`rust/` in this repo is the bridge (axum + tokio +
-chromiumoxide): scoped API keys, SSRF firewall, FormGuard vault, perception
-plane (AX snapshot / Set-of-Marks / DOM diffing), playbook engine, and an MCP
-server (`--mcp-stdio`, 10 tools). CI builds and tests it on every push.
+`rust/` in this repo is the live bridge (axum + tokio + chromiumoxide):
+scoped API keys, SSRF firewall, FormGuard vault, perception plane (AX
+snapshot / Set-of-Marks / DOM diffing), playbook engine, and an MCP server
+(`--mcp-stdio`, 10 tools). CI builds and tests it on every push. The bridge
+spawns and supervises its own headed Chrome via a swappable `BrowserBackend`
+trait (Chrome is the first backend); it also vendors a patched
+chromiumoxide 0.7.0 (`rust/vendor/chromiumoxide`) whose WS layer skips
+unparseable messages (CDP protocol drift) instead of killing the connection.
