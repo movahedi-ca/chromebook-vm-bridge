@@ -39,43 +39,49 @@ pub async fn navigate(
                 .into_response()
         }
     };
-    let (page, tab_id, evicted) = {
-        // Fast path: reuse the active tab under a read lock. No CDP call is
-        // ever made while holding the tabs lock (audit 41 MED-1): opening a
-        // page is a slow round-trip that used to block every read endpoint
-        // (/browser/tabs, /health's tab_count, ...) behind a write lock.
-        if let Some(active) = state.tabs.read().await.active_ref() {
-            (
-                active.page.clone(),
-                active.id.clone(),
-                Vec::<std::sync::Arc<chromiumoxide::Page>>::new(),
-            )
-        } else {
-            match browser.new_page(url.as_str()).await {
-                Ok(p) => {
-                    let page = std::sync::Arc::new(p);
-                    let id = uuid::Uuid::new_v4().to_string();
-                    // Write lock held only for the registry insert.
-                    let ev = state.tabs.write().await.insert(crate::state::TabEntry {
-                        id: id.clone(),
-                        page: page.clone(),
-                        baseline_hash: None,
-                        url: url.to_string(),
-                        title: String::new(),
-                    });
-                    (page, id, ev)
-                }
-                Err(e) => {
-                    // 503: the browser (our dependency) failed to open a
-                    // page — retryable, not a bridge bug (audit 41 LOW-10).
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(json!({"ok": false, "error": format!("new page: {}", e)})),
-                    )
-                        .into_response();
-                }
+    // Fast path: reuse the active tab under a read lock. The guard is
+    // scoped to this block and DROPPED before the else branch: holding a
+    // read guard across `state.tabs.write()` below would deadlock (the
+    // `if let` scrutinee temporary lives for the whole if/else).
+    // No CDP call is ever made while holding the tabs lock (audit 41
+    // MED-1): opening a page is a slow round-trip that used to block every
+    // read endpoint (/browser/tabs, /health's tab_count, ...) behind a
+    // write lock.
+    let active = {
+        let tabs = state.tabs.read().await;
+        tabs.active_ref()
+            .map(|a| (a.page.clone(), a.id.clone()))
+    };
+    let (page, tab_id, evicted) = match active {
+        Some((page, id)) => (
+            page,
+            id,
+            Vec::<std::sync::Arc<chromiumoxide::Page>>::new(),
+        ),
+        None => match browser.new_page(url.as_str()).await {
+            Ok(p) => {
+                let page = std::sync::Arc::new(p);
+                let id = uuid::Uuid::new_v4().to_string();
+                // Write lock held only for the registry insert.
+                let ev = state.tabs.write().await.insert(crate::state::TabEntry {
+                    id: id.clone(),
+                    page: page.clone(),
+                    baseline_hash: None,
+                    url: url.to_string(),
+                    title: String::new(),
+                });
+                (page, id, ev)
             }
-        }
+            Err(e) => {
+                // 503: the browser (our dependency) failed to open a
+                // page — retryable, not a bridge bug (audit 41 LOW-10).
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"ok": false, "error": format!("new page: {}", e)})),
+                )
+                    .into_response();
+            }
+        },
     };
     for p in evicted {
         crate::browser::actions::close_page(&p).await;
