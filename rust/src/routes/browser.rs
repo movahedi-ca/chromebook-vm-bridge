@@ -7,9 +7,8 @@
 //! 4. Return JSON with token-efficient shapes
 
 use crate::browser::tabs::ensure_browser;
-use crate::privy::validate_navigate_url;
 use crate::routes::not_implemented;
-use crate::routes::read::page_url_title;
+use crate::routes::read::{capture_png, page_url_title};
 use crate::state::SharedState;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::Deserialize;
@@ -26,15 +25,9 @@ pub async fn navigate(
     State(state): State<SharedState>,
     Json(req): Json<NavigateRequest>,
 ) -> impl IntoResponse {
-    let url = match validate_navigate_url(&req.url, &[]).await {
+    let url = match crate::privy::validated_url_or_400(&req.url).await {
         Ok(u) => u,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"ok": false, "error": e})),
-            )
-                .into_response()
-        }
+        Err(r) => return r,
     };
     let browser = match ensure_browser(&state).await {
         Ok(b) => b,
@@ -46,11 +39,15 @@ pub async fn navigate(
                 .into_response()
         }
     };
-    let (page, evicted) = {
-        let mut tabs = state.tabs.write().await;
-        if let Some(active) = tabs.active() {
+    let (page, tab_id, evicted) = {
+        // Fast path: reuse the active tab under a read lock. No CDP call is
+        // ever made while holding the tabs lock (audit 41 MED-1): opening a
+        // page is a slow round-trip that used to block every read endpoint
+        // (/browser/tabs, /health's tab_count, ...) behind a write lock.
+        if let Some(active) = state.tabs.read().await.active_ref() {
             (
                 active.page.clone(),
+                active.id.clone(),
                 Vec::<std::sync::Arc<chromiumoxide::Page>>::new(),
             )
         } else {
@@ -58,21 +55,24 @@ pub async fn navigate(
                 Ok(p) => {
                     let page = std::sync::Arc::new(p);
                     let id = uuid::Uuid::new_v4().to_string();
-                    let ev = tabs.insert(crate::state::TabEntry {
+                    // Write lock held only for the registry insert.
+                    let ev = state.tabs.write().await.insert(crate::state::TabEntry {
                         id: id.clone(),
                         page: page.clone(),
                         baseline_hash: None,
                         url: url.to_string(),
                         title: String::new(),
                     });
-                    (page, ev)
+                    (page, id, ev)
                 }
                 Err(e) => {
+                    // 503: the browser (our dependency) failed to open a
+                    // page — retryable, not a bridge bug (audit 41 LOW-10).
                     return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
+                        StatusCode::SERVICE_UNAVAILABLE,
                         Json(json!({"ok": false, "error": format!("new page: {}", e)})),
                     )
-                        .into_response()
+                        .into_response();
                 }
             }
         }
@@ -87,6 +87,11 @@ pub async fn navigate(
     match nav_result {
         Ok(Ok(_)) => {
             let (final_url, title) = page_url_title(&page).await;
+            // Capture the verification baseline once navigation settles so
+            // /browser/state's hash_match reflects reality (audit 41 MED-4).
+            // Best-effort: a failed capture leaves baseline None (unknown),
+            // which can never produce a false match.
+            capture_baseline(&state, &tab_id, &page).await;
             (
                 StatusCode::OK,
                 Json(json!({"title": title, "url": final_url, "verified": true})),
@@ -106,8 +111,40 @@ pub async fn navigate(
     }
 }
 
+/// Capture a screenshot dHash as the tab's verification baseline (audit 41
+/// MED-4). Shared by `navigate` and `tab_new`. Best-effort: any failure
+/// leaves `baseline_hash` None (unknown) rather than a wrong value, and a
+/// tab evicted mid-flight is logged, not crashed on.
+pub(crate) async fn capture_baseline(
+    state: &SharedState,
+    tab_id: &str,
+    page: &std::sync::Arc<chromiumoxide::Page>,
+) {
+    let png = match capture_png(page).await {
+        Ok(png) => png,
+        Err(e) => {
+            tracing::warn!(tab_id, error = %e, "baseline capture failed; leaving None");
+            return;
+        }
+    };
+    // dHash decodes + resamples the full frame: blocking pool, never the
+    // async runtime (audit 40 MED-6).
+    let hash = tokio::task::spawn_blocking(move || crate::browser::verify::dhash(&png))
+        .await
+        .unwrap_or(0);
+    if hash == 0 {
+        // verify::dhash returns 0 for undecodable input; the verify
+        // pipeline forbids 0 from ever matching (audit 41 MED-3).
+        tracing::warn!(tab_id, "baseline hash undecodable; leaving None");
+        return;
+    }
+    if !state.tabs.write().await.set_baseline(tab_id, hash) {
+        tracing::warn!(tab_id, "tab evicted before baseline could be stored");
+    }
+}
+
 /// Stubs (501) for endpoints whose handlers are not built yet. Each is
-/// registered in main.rs and returns the standard not_implemented shape
+/// registered in main.rs and returns the standard `not_implemented` shape
 /// so contract tests can distinguish "not built" from "broken".
 pub async fn fill_react(State(_state): State<SharedState>) -> impl IntoResponse {
     not_implemented("fill_react").await
