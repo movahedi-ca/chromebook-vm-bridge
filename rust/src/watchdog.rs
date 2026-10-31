@@ -1,9 +1,9 @@
-//! Watchdog: health probing, sd_notify, and sleep-state resilience.
+//! Watchdog: health probing, `sd_notify`, and sleep-state resilience.
 //!
 //! Fixes audit BUG-3:
 //! - Probe wrapped in timeout (3s), loop sleeps 10s — systemd gets
 //!   WATCHDOG=1 every ~13s, well under WatchdogSec=60. No more suicide
-//!   when a heavy page stalls evaluate().
+//!   when a heavy page stalls `evaluate()`.
 //! - WATCHDOG=1 pinged immediately BEFORE any browser relaunch.
 //! - Monotonic-vs-wall clock jump detector (>5s) catches Chromebook
 //!   sleep/wake: flushes dead sockets, re-verifies network.
@@ -15,8 +15,10 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 /// Check systemd notify support. Uses the `systemd` crate if available,
-/// falls back to direct socket write to $NOTIFY_SOCKET.
-fn sd_notify(state: &str) {
+/// falls back to direct socket write to $`NOTIFY_SOCKET`.
+/// pub(crate): main.rs sends READY=1 after the listener binds (audit 41
+/// LOW-5) and in --mcp-stdio mode; the watchdog only sends WATCHDOG=1 pings.
+pub(crate) fn sd_notify(state: &str) {
     if let Ok(sock_path) = std::env::var("NOTIFY_SOCKET") {
         use std::os::unix::net::UnixDatagram;
         // Use unbound socket for sending (abstract namespace safe)
@@ -30,8 +32,9 @@ pub async fn run(state: SharedState) {
     let interval_s = state.config.watchdog_interval_s;
     let probe_timeout = Duration::from_secs(state.config.watchdog_probe_timeout_s);
 
-    // Signal readiness to systemd after first successful setup
-    sd_notify("READY=1");
+    // Readiness (READY=1) is signaled by main.rs after the HTTP listener
+    // binds, or before serve_stdio in --mcp-stdio mode (audit 41 LOW-5).
+    // This task only sends periodic WATCHDOG=1 pings.
     tracing::info!("watchdog started");
 
     let mut last_wall = std::time::SystemTime::now();
