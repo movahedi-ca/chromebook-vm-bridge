@@ -154,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/browser/type_verified", post(routes::input::type_verified))
         .route("/browser/press", post(routes::input::press))
         .route("/browser/wait", post(routes::input::wait))
+        .route("/browser/batch", post(routes::batch::batch))
         .route("/browser/eval", post(routes::input::eval))
         .route("/browser/script", post(routes::advanced::script))
         .route("/browser/order", post(routes::advanced::order))
