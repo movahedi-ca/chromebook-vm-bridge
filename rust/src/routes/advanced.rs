@@ -203,6 +203,8 @@ struct DiffResult {
 /// Compare two PNGs pixel-wise. The reference is resized to the current
 /// frame when sizes differ. A pixel counts as changed when its maximum
 /// per-channel absolute difference exceeds `threshold`.
+#[allow(clippy::cast_precision_loss)] // u64 pixel counts -> f64 ratio; sub-pixel precision irrelevant
+#[allow(clippy::many_single_char_names)] // pixel loops: x/y/w/h/a/b are conventional
 fn diff_images(
     current_png: &[u8],
     reference_png: &[u8],
@@ -223,7 +225,7 @@ fn diff_images(
         );
     }
     let (w, h) = cur.dimensions();
-    let total = w as u64 * h as u64;
+    let total = u64::from(w) * u64::from(h);
     let mut changed = 0u64;
     let mut bbox: Option<(u32, u32, u32, u32)> = None;
     for y in 0..h {
@@ -273,7 +275,7 @@ fn png_bytes(img: &image::RgbImage) -> anyhow::Result<Vec<u8>> {
 /// then label/placeholder (fill only), then the title attribute.
 /// Returns the winning element's center `{x, y}` or null.
 /// The most specific (shortest-text) visible match wins, so containers
-/// like <body> never shadow the real control.
+/// like \<body\> never shadow the real control.
 const ORDER_RESOLVE_JS: &str = r#"(text, role, isFill) => {
     const vis = (el) => {
         if (!el || !el.isConnected) return false;
@@ -364,8 +366,8 @@ async fn resolve_order_center(
         if let Ok(v) = eval_json(page, &js).await {
             if !v.is_null() {
                 if let (Some(x), Some(y)) = (
-                    v.get("x").and_then(|n| n.as_f64()),
-                    v.get("y").and_then(|n| n.as_f64()),
+                    v.get("x").and_then(serde_json::Value::as_f64),
+                    v.get("y").and_then(serde_json::Value::as_f64),
                 ) {
                     return Some((x, y));
                 }
@@ -438,13 +440,8 @@ pub async fn order(
         req.timeout_ms,
     )
     .await;
-    let (x, y) = match target {
-        Some(pt) => pt,
-        None => {
-            return ok_json(
-                json!({"ok": false, "error": format!("could not resolve '{}'", req.text)}),
-            )
-        }
+    let Some((x, y)) = target else {
+        return ok_json(json!({"ok": false, "error": format!("could not resolve '{}'", req.text)}));
     };
     if action == "click" {
         if let Err(e) = mouse_click(&page, x, y).await {
@@ -469,7 +466,7 @@ pub async fn order(
 // ---------------------------------------------------------------------------
 
 /// Center of the visible `[role="option"]` at `idx` (index into the
-/// visible-option list produced by AUTOCOMPLETE_JS), or null.
+/// visible-option list produced by `AUTOCOMPLETE_JS`), or null.
 const OPTION_CENTER_JS: &str = r#"(idx) => {
     const listbox = document.querySelector('[role="listbox"]') || document;
     const opts = Array.from(listbox.querySelectorAll('[role="option"]'))
@@ -589,8 +586,8 @@ pub async fn autocomplete(
     let center_js = format!("({})({})", OPTION_CENTER_JS, winner.index);
     let (ox, oy) = match eval_json(&page, &center_js).await {
         Ok(v) => match (
-            v.get("x").and_then(|n| n.as_f64()),
-            v.get("y").and_then(|n| n.as_f64()),
+            v.get("x").and_then(serde_json::Value::as_f64),
+            v.get("y").and_then(serde_json::Value::as_f64),
         ) {
             (Some(ox), Some(oy)) => (ox, oy),
             _ => return ok_json(json!({"ok": false, "error": "option has no box"})),
@@ -767,13 +764,21 @@ fn default_similarity_threshold() -> f64 {
     0.97
 }
 
-/// POST /browser/assert_visual — clip a region, compare against the
-/// reference PNG, and report a similarity score in [0,1].
+/// POST /`browser/assert_visual` — clip a region, compare against the
+/// reference PNG, and report a similarity score in \[0,1\].
 /// Never mutates any baseline: this is a read-only assertion.
+#[allow(clippy::cast_precision_loss)] // u64 pixel counts -> f64 ratio; sub-pixel precision irrelevant
 pub async fn assert_visual(
     State(state): State<SharedState>,
     Json(req): Json<AssertVisualRequest>,
 ) -> impl IntoResponse {
+    // Decode + full-frame pixel comparison are CPU-bound: run them on the
+    // blocking pool, never the async runtime (audit 41 MED-5 — the sibling
+    // endpoints were fixed for the same class in audit 40 MED-6).
+    enum VisualErr {
+        Capture(String),
+        Reference(String),
+    }
     let reference = match base64_decode(&req.reference_b64) {
         Ok(b) => b,
         Err(e) => {
@@ -787,6 +792,17 @@ pub async fn assert_visual(
         Ok(v) => v,
         Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
     };
+    // Similarity threshold is documented 0..1; reject NaN/infinity and
+    // clamp (proactive-3: an unclamped NaN made every assertion fail
+    // silently via `score >= NaN == false`).
+    let threshold = if req.threshold.is_finite() {
+        req.threshold.clamp(0.0, 1.0)
+    } else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "threshold must be a finite number in [0, 1]",
+        );
+    };
     let page = match active_page(&state).await {
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_GATEWAY, format!("no active page: {e}")),
@@ -795,42 +811,58 @@ pub async fn assert_visual(
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_GATEWAY, e.to_string()),
     };
-    // Grayscale comparison with a small per-pixel tolerance absorbs
-    // antialiasing jitter; the score is the fraction of pixels within it.
-    let cur_gray = match image::load_from_memory(&png) {
-        Ok(img) => img.to_luma8(),
-        Err(e) => return err(StatusCode::BAD_GATEWAY, format!("decode capture: {e}")),
-    };
-    let mut ref_gray = match image::load_from_memory(&reference) {
-        Ok(img) => img.to_luma8(),
-        Err(e) => return err(StatusCode::BAD_REQUEST, format!("decode reference: {e}")),
-    };
-    if ref_gray.dimensions() != cur_gray.dimensions() {
-        ref_gray = image::imageops::resize(
-            &ref_gray,
-            cur_gray.width(),
-            cur_gray.height(),
-            image::imageops::FilterType::Triangle,
-        );
-    }
-    let (w, h) = cur_gray.dimensions();
-    let total = w as u64 * h as u64;
-    let mut within = 0u64;
-    for y in 0..h {
-        for x in 0..w {
-            if cur_gray.get_pixel(x, y)[0].abs_diff(ref_gray.get_pixel(x, y)[0]) <= 12 {
-                within += 1;
+    let score = match tokio::task::spawn_blocking(move || -> Result<f64, VisualErr> {
+        let cur_gray = image::load_from_memory(&png)
+            .map_err(|e| VisualErr::Capture(e.to_string()))?
+            .to_luma8();
+        let mut ref_gray = image::load_from_memory(&reference)
+            .map_err(|e| VisualErr::Reference(e.to_string()))?
+            .to_luma8();
+        if ref_gray.dimensions() != cur_gray.dimensions() {
+            ref_gray = image::imageops::resize(
+                &ref_gray,
+                cur_gray.width(),
+                cur_gray.height(),
+                image::imageops::FilterType::Triangle,
+            );
+        }
+        // Grayscale comparison with a small per-pixel tolerance absorbs
+        // antialiasing jitter; the score is the fraction of pixels within it.
+        let (w, h) = cur_gray.dimensions();
+        let total = u64::from(w) * u64::from(h);
+        let mut within = 0u64;
+        for y in 0..h {
+            for x in 0..w {
+                if cur_gray.get_pixel(x, y)[0].abs_diff(ref_gray.get_pixel(x, y)[0]) <= 12 {
+                    within += 1;
+                }
             }
         }
-    }
-    let score = if total == 0 {
-        1.0
-    } else {
-        within as f64 / total as f64
+        Ok(if total == 0 {
+            1.0
+        } else {
+            within as f64 / total as f64
+        })
+    })
+    .await
+    {
+        Ok(Ok(score)) => score,
+        Ok(Err(VisualErr::Capture(e))) => {
+            return err(StatusCode::BAD_GATEWAY, format!("decode capture: {e}"))
+        }
+        Ok(Err(VisualErr::Reference(e))) => {
+            return err(StatusCode::BAD_REQUEST, format!("decode reference: {e}"))
+        }
+        Err(e) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("visual compare task failed: {e}"),
+            )
+        }
     };
     ok_json(json!({
         "ok": true,
-        "match": score >= req.threshold,
+        "match": score >= threshold,
         "score": score,
     }))
 }
@@ -850,6 +882,7 @@ fn default_diff_threshold() -> i64 {
 /// POST /browser/screenshot/compare — full-page screenshot vs a reference
 /// PNG, VM-side. Returns match verdict, similarity score, changed-pixel
 /// stats, and the current perceptual hash.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // threshold clamped to [0,255] above, so the i64->u8 cast is exact
 pub async fn screenshot_compare(
     State(state): State<SharedState>,
     Json(req): Json<CompareRequest>,
@@ -926,10 +959,18 @@ fn default_quality() -> u8 {
 /// POST /browser/screenshot/delta — diff the current frame against the
 /// reference and return the changed region as a base64 PNG patch
 /// (empty string when nothing changed).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // threshold clamped to [0,255] above, so the i64->u8 cast is exact
 pub async fn screenshot_delta(
     State(state): State<SharedState>,
     Json(req): Json<DeltaRequest>,
 ) -> impl IntoResponse {
+    // CPU-bound pixel work (diff + patch decode/crop) runs on the blocking
+    // pool, never the async runtime (audit 40 MED-6; proactive-1: the patch
+    // decode/crop used to run on the handler thread after the diff task).
+    enum DeltaErr {
+        Diff(String),
+        Capture(String),
+    }
     let _ = req.session_id; // contract field; see struct docs
     let _ = req.quality; // contract field; patches are PNG, see struct docs
     if req.reference_b64.trim().is_empty() {
@@ -953,44 +994,47 @@ pub async fn screenshot_delta(
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_GATEWAY, e.to_string()),
     };
-    // CPU-bound pixel work runs on the blocking pool, never the async
-    // runtime (audit 40 MED-6). Clone the frame: `png` is still needed
-    // below for the patch crop.
-    let png_for_diff = png.clone();
-    let diff = match tokio::task::spawn_blocking(move || {
-        diff_images(&png_for_diff, &reference, threshold)
-    })
-    .await
-    {
-        Ok(Ok(d)) => d,
-        Ok(Err(e)) => return err(StatusCode::BAD_REQUEST, e.to_string()),
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("diff task: {e}")),
-    };
-    let patch_b64 = match diff.bbox {
-        None => String::new(),
-        Some((x0, y0, x1, y1)) => {
-            // Pad slightly so patch edges composite cleanly.
-            let cur = match image::load_from_memory(&png) {
-                Ok(img) => img.to_rgb8(),
-                Err(e) => return err(StatusCode::BAD_GATEWAY, format!("decode capture: {e}")),
-            };
-            let (w, h) = cur.dimensions();
-            let px0 = x0.saturating_sub(4);
-            let py0 = y0.saturating_sub(4);
-            let px1 = (x1 + 4).min(w);
-            let py1 = (y1 + 4).min(h);
-            if px1 <= px0 || py1 <= py0 {
-                String::new()
-            } else {
-                let patch =
-                    image::imageops::crop_imm(&cur, px0, py0, px1 - px0, py1 - py0).to_image();
-                match png_bytes(&patch) {
-                    Ok(bytes) => base64_encode(&bytes),
-                    Err(e) => return err(StatusCode::BAD_GATEWAY, e.to_string()),
+    let (diff, patch_b64) =
+        match tokio::task::spawn_blocking(move || -> Result<(DiffResult, String), DeltaErr> {
+            let diff = diff_images(&png, &reference, threshold)
+                .map_err(|e| DeltaErr::Diff(e.to_string()))?;
+            let patch_b64 = match diff.bbox {
+                None => String::new(),
+                Some((x0, y0, x1, y1)) => {
+                    // Pad slightly so patch edges composite cleanly.
+                    let cur = image::load_from_memory(&png)
+                        .map_err(|e| DeltaErr::Capture(format!("decode capture: {e}")))?
+                        .to_rgb8();
+                    let (w, h) = cur.dimensions();
+                    let px0 = x0.saturating_sub(4);
+                    let py0 = y0.saturating_sub(4);
+                    let px1 = (x1 + 4).min(w);
+                    let py1 = (y1 + 4).min(h);
+                    if px1 <= px0 || py1 <= py0 {
+                        String::new()
+                    } else {
+                        let patch = image::imageops::crop_imm(&cur, px0, py0, px1 - px0, py1 - py0)
+                            .to_image();
+                        png_bytes(&patch)
+                            .map(|b| base64_encode(&b))
+                            .map_err(|e| DeltaErr::Capture(e.to_string()))?
+                    }
                 }
+            };
+            Ok((diff, patch_b64))
+        })
+        .await
+        {
+            Ok(Ok((diff, patch_b64))) => (diff, patch_b64),
+            Ok(Err(DeltaErr::Diff(e))) => return err(StatusCode::BAD_REQUEST, e),
+            Ok(Err(DeltaErr::Capture(e))) => return err(StatusCode::BAD_GATEWAY, e),
+            Err(e) => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("delta task: {e}"),
+                )
             }
-        }
-    };
+        };
     ok_json(json!({
         "ok": true,
         "changed": diff.bbox.is_some(),
@@ -1053,34 +1097,29 @@ pub struct UploadRequest {
     #[serde(default)]
     pub selector: String,
     /// Local path of the file to attach. Must exist, be a regular file,
-    /// and live under the staging allowlist (`~/jobs/uploads`).
+    /// and live under the staging allowlist (`config.upload_dirs`).
     pub path: String,
-}
-
-/// Staging allowlist for uploads: `~/jobs/uploads` (created on demand).
-fn upload_allowlist() -> anyhow::Result<Vec<std::path::PathBuf>> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
-    let staging = home.join("jobs").join("uploads");
-    std::fs::create_dir_all(&staging)
-        .map_err(|e| anyhow::anyhow!("cannot create staging dir: {e}"))?;
-    Ok(vec![staging])
 }
 
 /// POST /browser/upload — attach a local file to a file input via
 /// `DOM.setFileInputFiles`. No OS-level file chooser is ever opened.
+///
+/// The staging allowlist is `config.upload_dirs` (created at startup in
+/// main.rs) — the SAME knob the MCP `upload` tool validates against.
+/// (Audit 41 MED-6: this route used to hardcode `~/jobs/uploads` while MCP
+/// read the config, a split-brain allowlist.)
+#[allow(clippy::too_many_lines)] // upload is linear validate->stage->verify steps; splitting would obscure the flow
+#[allow(clippy::many_single_char_names)] // coordinate/dimension bindings follow convention
 pub async fn upload(
     State(state): State<SharedState>,
     Json(req): Json<UploadRequest>,
 ) -> impl IntoResponse {
     // 1. The path must exist and be a regular file.
-    let meta = match std::fs::metadata(&req.path) {
-        Ok(m) => m,
-        Err(_) => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                format!("upload path not accessible: {}", req.path),
-            )
-        }
+    let Ok(meta) = std::fs::metadata(&req.path) else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("upload path not accessible: {}", req.path),
+        );
     };
     if !meta.is_file() {
         return err(
@@ -1089,10 +1128,7 @@ pub async fn upload(
         );
     }
     // 2. Canonicalize and enforce the staging allowlist.
-    let allowlist = match upload_allowlist() {
-        Ok(a) => a,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    };
+    let allowlist = state.config.upload_dirs.clone();
     let canonical = match validate_upload_path(&req.path, &allowlist) {
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
@@ -1144,8 +1180,14 @@ pub async fn upload(
         // buttons and one level into shadow roots).
         let detail = match eval_json(&page, UPLOAD_STAGE1_JS).await {
             Ok(v) => {
-                if v.get("found").and_then(|f| f.as_bool()).unwrap_or(false) {
-                    let hidden = v.get("hidden").and_then(|h| h.as_bool()).unwrap_or(false);
+                if v.get("found")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    let hidden = v
+                        .get("hidden")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
                     format!(
                         "a file input exists{} but the selector did not match it",
                         if hidden {
@@ -1196,6 +1238,7 @@ pub async fn upload(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::many_single_char_names)] // test pixel helpers: w/h/r/g/b are conventional
     use super::*;
 
     #[test]
