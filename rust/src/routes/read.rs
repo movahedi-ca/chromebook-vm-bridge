@@ -18,9 +18,10 @@
 use crate::browser::actions::{active_page, close_page, eval_json};
 use crate::browser::geometry::GEOMETRY_JS;
 use crate::perception::{AxMapper, AX_SNAPSHOT_CAP};
+use crate::routes::advanced::base64_decode;
 use crate::state::{SharedState, TabEntry};
 use axum::{
-    extract::{Json, State},
+    extract::{Json, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -56,12 +57,47 @@ fn internal_error(msg: impl Into<String>) -> Response {
 }
 
 /// Capture the viewport as PNG bytes (30s cap).
+///
+/// Uses the vendored `screenshot_base64` and decodes in `spawn_blocking`:
+/// Base64-decoding ~300KB is CPU work that does not belong on the async
+/// executor (audit 42 follow-up; audit 40 MED-6).
 pub(crate) async fn capture_png(page: &chromiumoxide::Page) -> anyhow::Result<Vec<u8>> {
     let params = chromiumoxide::page::ScreenshotParams::builder().build();
-    let png = tokio::time::timeout(Duration::from_secs(30), page.screenshot(params))
+    let b64 = tokio::time::timeout(Duration::from_secs(30), page.screenshot_base64(params))
         .await
         .map_err(|_| anyhow::anyhow!("screenshot timed out"))??;
+    let png = tokio::task::spawn_blocking(move || {
+        base64_decode(&b64).map_err(|e| anyhow::anyhow!("screenshot base64: {e}"))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("screenshot decode task: {e}"))??;
     Ok(png)
+}
+
+/// Capture the viewport as JPEG bytes at the given quality (30s cap).
+/// Chrome encodes the JPEG natively via CDP `Page.captureScreenshot`
+/// (`format: jpeg`); no PNG round-trip. Used for the opt-in
+/// `?format=jpeg` screenshot path (bandwidth-sensitive SoM/MCP
+/// consumers). Default quality 80.
+pub(crate) async fn capture_jpeg(
+    page: &chromiumoxide::Page,
+    quality: i64,
+) -> anyhow::Result<Vec<u8>> {
+    use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
+    let params = chromiumoxide::page::ScreenshotParams::builder()
+        .format(CaptureScreenshotFormat::Jpeg)
+        .quality(quality)
+        .build();
+    let b64 = tokio::time::timeout(Duration::from_secs(30), page.screenshot_base64(params))
+        .await
+        .map_err(|_| anyhow::anyhow!("screenshot timed out"))??;
+    // Same off-executor decode discipline as `capture_png`.
+    let jpeg = tokio::task::spawn_blocking(move || {
+        base64_decode(&b64).map_err(|e| anyhow::anyhow!("screenshot base64: {e}"))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("screenshot decode task: {e}"))??;
+    Ok(jpeg)
 }
 
 /// 64-bit perceptual hash (dHash) of PNG bytes.
@@ -96,16 +132,44 @@ pub async fn text(State(state): State<SharedState>) -> impl IntoResponse {
         Ok(p) => p,
         Err(e) => return bad_gateway(format!("no active page: {e}")),
     };
-    let (url, title) = page_url_title(&page).await;
-    let v = match eval_json(&page, "document.body ? document.body.innerText : ''").await {
+    // Single CDP round trip for url + title + text (was: page.url(),
+    // get_title(), and innerText as three separate calls). The in-page
+    // slice carries a 256-char lookahead margin and `.toWellFormed()`:
+    // JS.slice() indexes UTF-16 code units and can split a surrogate pair
+    // at the boundary; toWellFormed() replaces lone surrogates with U+FFFD
+    // so CDP never ships broken UTF-16. Redaction runs in Rust over the
+    // FULL lookahead buffer BEFORE the final truncation — a secret
+    // straddling the 12k boundary is still caught (audit 42 High-5
+    // follow-up: truncating first leaked the split half).
+    const TEXT_LIMIT: usize = 12_000;
+    const LOOKAHEAD: usize = 256;
+    let js = format!(
+        "(() => {{ const t = document.body ? document.body.innerText : ''; \
+           return {{url: location.href, title: document.title, \
+                   text: t.slice(0, {}).toWellFormed()}}; }})()",
+        TEXT_LIMIT + LOOKAHEAD
+    );
+    let v = match eval_json(&page, &js).await {
         Ok(v) => v,
         Err(e) => return bad_gateway(format!("evaluate text: {e}")),
     };
-    let text: String = v.as_str().unwrap_or("").chars().take(12000).collect();
+    let url = v
+        .get("url")
+        .and_then(|u| u.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let title = v
+        .get("title")
+        .and_then(|t| t.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let raw = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
     // Audit 42 High-5: PII/secret redaction on the way out. READ-scope
     // callers must not receive raw credential/token values scraped from
-    // the page.
-    let (text, redactions) = crate::privy::redact(&text);
+    // the page. Runs over the lookahead buffer, then truncated to the
+    // exact char limit.
+    let (redacted, redactions) = crate::privy::redact(raw);
+    let text: String = redacted.chars().take(TEXT_LIMIT).collect();
     (
         StatusCode::OK,
         Json(
@@ -121,15 +185,32 @@ pub async fn html(State(state): State<SharedState>) -> impl IntoResponse {
         Ok(p) => p,
         Err(e) => return bad_gateway(format!("no active page: {e}")),
     };
-    let (url, _) = page_url_title(&page).await;
-    let v = match eval_json(&page, "document.documentElement.outerHTML").await {
+    // Single CDP round trip (was: page.url() + outerHTML as two calls),
+    // with the same 256-char lookahead + toWellFormed() + redact-before-
+    // truncate discipline as `text()` above.
+    const HTML_LIMIT: usize = 20_000;
+    const LOOKAHEAD: usize = 256;
+    let js = format!(
+        "(() => {{ const h = document.documentElement.outerHTML; \
+           return {{url: location.href, \
+                   html: h.slice(0, {}).toWellFormed()}}; }})()",
+        HTML_LIMIT + LOOKAHEAD
+    );
+    let v = match eval_json(&page, &js).await {
         Ok(v) => v,
         Err(e) => return bad_gateway(format!("evaluate html: {e}")),
     };
-    let html: String = v.as_str().unwrap_or("").chars().take(20000).collect();
+    let url = v
+        .get("url")
+        .and_then(|u| u.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let raw = v.get("html").and_then(|h| h.as_str()).unwrap_or("");
     // Audit 42 High-5: redact secrets from markup too (inline scripts and
-    // hidden inputs often carry tokens).
-    let (html, redactions) = crate::privy::redact(&html);
+    // hidden inputs often carry tokens). Runs over the lookahead buffer,
+    // then truncated to the exact char limit.
+    let (redacted, redactions) = crate::privy::redact(raw);
+    let html: String = redacted.chars().take(HTML_LIMIT).collect();
     (
         StatusCode::OK,
         Json(json!({"ok": true, "url": url, "html": html, "redactions": redactions})),
@@ -139,12 +220,143 @@ pub async fn html(State(state): State<SharedState>) -> impl IntoResponse {
 
 /// GET /browser/snapshot — interactive elements with stable `[ref]` handles.
 ///
-/// Uses CDP Accessibility.getFullAXTree (no pixels): each returned node
-/// carries `ref` (dense from 1 in tree order), `role`, `name`, and the
-/// `backendNodeId` that the `click_node` endpoint resolves. Refs are
-/// re-mapped into the per-tab `AxMapper` on every snapshot so a stale
-/// ref can never address a node from a previous document.
-pub async fn snapshot(State(state): State<SharedState>) -> impl IntoResponse {
+/// `?source=axtree` selects the opt-in CDP `Accessibility.getFullAXTree`
+/// source instead of the default DOM walker. The walker stays the
+/// default: getFullAXTree is unreliable on attached browsers (see the
+/// walker-path comment), and the AXTree node order/shape differs. Both
+/// sources emit the SAME response shape
+/// (`{ref, role, name, backendNodeId}`) and register refs in the
+/// per-tab `AxMapper`, so downstream consumers (`click_node`, MCP
+/// tools) work unchanged.
+#[derive(Deserialize)]
+pub struct SnapshotQuery {
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// Minimal `Accessibility.getFullAXTree` CDP command — not present in
+/// chromiumoxide_cdp 0.7.0's generated bindings, so it is defined here.
+/// Used ONLY by the opt-in `?source=axtree` snapshot path.
+#[derive(Debug, serde::Serialize)]
+struct GetFullAXTree {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_depth: Option<i64>,
+}
+
+impl chromiumoxide::types::Method for GetFullAXTree {
+    fn identifier(&self) -> chromiumoxide::types::MethodId {
+        "Accessibility.getFullAXTree".into()
+    }
+}
+
+impl chromiumoxide::types::Command for GetFullAXTree {
+    type Response = FullAXTreeResponse;
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FullAXTreeResponse {
+    nodes: Vec<FullAXNode>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FullAXNode {
+    #[serde(rename = "backendDOMNodeId", default)]
+    backend_dom_node_id: Option<i64>,
+    #[serde(default)]
+    ignored: bool,
+    #[serde(default)]
+    role: Option<FullAXValue>,
+    #[serde(default)]
+    name: Option<FullAXValue>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FullAXValue {
+    value: Option<serde_json::Value>,
+}
+
+/// AXTree-sourced snapshot (opt-in). Maps AX nodes onto the standard
+/// `{ref, role, name, backendNodeId}` shape: ignored nodes and nodes
+/// without a `backendDOMNodeId` are skipped (click_node needs the
+/// backend id), refs are dense from 1 in tree order.
+async fn snapshot_axtree(
+    state: &SharedState,
+    page: &Arc<chromiumoxide::Page>,
+    url: &str,
+    title: &str,
+) -> Response {
+    let cmd = GetFullAXTree { max_depth: None };
+    let resp = match tokio::time::timeout(Duration::from_secs(15), page.execute(cmd)).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return bad_gateway(format!("axtree snapshot failed: {e}")),
+        Err(_) => return bad_gateway("axtree snapshot timed out"),
+    };
+    // Tab id for the per-tab ref mapper (same as the walker path).
+    let tab_id = {
+        let mut tabs = state.tabs.write().await;
+        tabs.active().map(|e| e.id.clone()).unwrap_or_default()
+    };
+    let mut nodes_out = Vec::new();
+    let truncated: bool;
+    {
+        let mut mappers = state.ax_mappers.lock().await;
+        let mapper = mappers.entry(tab_id).or_insert_with(AxMapper::new);
+        mapper.clear();
+        let mut seen = 0usize;
+        for node in &resp.result.nodes {
+            if node.ignored {
+                continue;
+            }
+            let backend_id = match node.backend_dom_node_id {
+                Some(id) => id,
+                None => continue,
+            };
+            let role = node
+                .role
+                .as_ref()
+                .and_then(|r| r.value.as_ref())
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = node
+                .name
+                .as_ref()
+                .and_then(|n| n.value.as_ref())
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if seen >= AX_SNAPSHOT_CAP {
+                continue;
+            }
+            seen += 1;
+            let r = mapper.insert(backend_id);
+            nodes_out.push(json!({
+                "ref": r,
+                "role": role,
+                "name": name,
+                "backendNodeId": backend_id,
+            }));
+        }
+        truncated = resp.result.nodes.len() > seen;
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "url": url,
+            "title": title,
+            "nodes": nodes_out,
+            "truncated": truncated,
+            "source": "axtree",
+        })),
+    )
+        .into_response()
+}
+
+pub async fn snapshot(
+    State(state): State<SharedState>,
+    Query(q): Query<SnapshotQuery>,
+) -> impl IntoResponse {
     const SELECTOR: &str = "button, a[href], input, select, textarea, [role='button'], [role='link'], [role='textbox'], [role='searchbox'], [role='combobox'], [role='checkbox'], [role='radio'], [role='option'], [role='menuitem'], [role='tab'], [role='slider'], [role='spinbutton']";
     const WALKER_JS: &str = r#"(() => {
         const els = Array.from(document.querySelectorAll("button, a[href], input, select, textarea, [role='button'], [role='link'], [role='textbox'], [role='searchbox'], [role='combobox'], [role='checkbox'], [role='radio'], [role='option'], [role='menuitem'], [role='tab'], [role='slider'], [role='spinbutton']"));
@@ -176,6 +388,14 @@ pub async fn snapshot(State(state): State<SharedState>) -> impl IntoResponse {
         Err(e) => return bad_gateway(format!("no active page: {e}")),
     };
     let (url, title) = page_url_title(&page).await;
+
+    // Opt-in AXTree source (default stays the DOM walker).
+    if q.source
+        .as_deref()
+        .is_some_and(|s| s.eq_ignore_ascii_case("axtree"))
+    {
+        return snapshot_axtree(&state, &page, &url, &title).await;
+    }
 
     // Two-call snapshot: (1) JS walker returns [role, name] pairs in document
     // order; (2) find_elements returns Elements with backend_node_id in the
@@ -269,12 +489,36 @@ pub async fn snapshot(State(state): State<SharedState>) -> impl IntoResponse {
         .into_response()
 }
 
-/// GET /browser/screenshot — raw PNG bytes of the viewport (not JSON).
-pub async fn screenshot(State(state): State<SharedState>) -> impl IntoResponse {
+/// GET /browser/screenshot — raw image bytes of the viewport (not JSON).
+///
+/// `?format=jpeg` opts into a JPEG-80 capture (Chrome-native encode,
+/// ~5-10x smaller than PNG) for bandwidth-sensitive consumers; the
+/// default stays PNG so existing pixel-pipeline consumers (compare,
+/// delta, dHash baselines) are unaffected.
+#[derive(Deserialize)]
+pub struct ScreenshotQuery {
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+pub async fn screenshot(
+    State(state): State<SharedState>,
+    Query(q): Query<ScreenshotQuery>,
+) -> impl IntoResponse {
     let page = match active_page(&state).await {
         Ok(p) => p,
         Err(e) => return bad_gateway(format!("no active page: {e}")),
     };
+    if q.format
+        .as_deref()
+        .is_some_and(|f| f.eq_ignore_ascii_case("jpeg"))
+    {
+        let jpeg = match capture_jpeg(&page, 80).await {
+            Ok(j) => j,
+            Err(e) => return bad_gateway(format!("screenshot: {e}")),
+        };
+        return (StatusCode::OK, [(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response();
+    }
     let png = match capture_png(&page).await {
         Ok(p) => p,
         Err(e) => return bad_gateway(format!("screenshot: {e}")),
@@ -409,7 +653,11 @@ pub async fn tab_new(
     };
     // Defense in depth: literal-IP block patterns on the new target
     // (audit 42 High-1). Best-effort; the Rust firewall is the primary gate.
-    crate::browser::actions::install_blocked_url_patterns(&page).await;
+    crate::browser::actions::install_blocked_url_patterns(
+        &page,
+        &state.config.blocked_resource_patterns,
+    )
+    .await;
     let (url, title) = page_url_title(&page).await;
     // Re-run the SSRF firewall on the LANDED url (audit 42 High-1):
     // target creation navigates, and redirects can land where the
