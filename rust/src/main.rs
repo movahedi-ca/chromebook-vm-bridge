@@ -86,66 +86,78 @@ async fn main() -> anyhow::Result<()> {
         watchdog::run(wd_state).await;
     });
 
+    // Spawn the browser supervisor: the bridge owns exactly one browser
+    // daemon. It spawns the engine at startup, connects the CDP driver,
+    // watches the child, and relaunches with capped backoff when it dies.
+    // The engine behind it is swappable via BrowserBackend (see
+    // browser/backend.rs); construct a different backend here to swap.
+    let sup_state = state.clone();
+    tokio::spawn(async move {
+        let backend: Box<dyn crate::browser::backend::BrowserBackend> =
+            Box::new(crate::browser::backend_chrome::ChromeBackend::new());
+        crate::browser::supervise::run_supervisor(backend, sup_state).await;
+    });
+
     // Build router. Layer order (outermost first): rate_limit → auth → body_cap.
-    // NO OpenAPI docs exposed (audit: docs were disabled in Python too).
+    // NO OpenAPI docs exposed (audit: docs stay disabled).
     let app = Router::new()
         // Health + metrics
         .route("/health", get(routes::ops::health))
         .route("/metrics", get(routes::ops::metrics))
         // Browser routes
         .route("/browser/navigate", post(routes::browser::navigate))
-        .route("/browser/text", get(routes::browser::text))
-        .route("/browser/html", get(routes::browser::html))
-        .route("/browser/snapshot", get(routes::browser::snapshot))
-        .route("/browser/state", get(routes::browser::state))
-        .route("/browser/tabs", get(routes::browser::tabs))
-        .route("/browser/screenshot", get(routes::browser::screenshot))
+        .route("/browser/text", get(routes::read::text))
+        .route("/browser/html", get(routes::read::html))
+        .route("/browser/snapshot", get(routes::read::snapshot))
+        .route("/browser/state", get(routes::read::state))
+        .route("/browser/tabs", get(routes::read::tabs))
+        .route("/browser/screenshot", get(routes::read::screenshot))
         .route(
             "/browser/screenshot/hash",
-            get(routes::browser::screenshot_hash),
+            get(routes::read::screenshot_hash),
         )
-        .route("/browser/click", post(routes::browser::click))
-        .route("/browser/click_at", post(routes::browser::click_at))
-        .route("/browser/click_node", post(routes::browser::click_node))
-        .route("/browser/click_screen", post(routes::browser::click_screen))
-        .route("/browser/double_click", post(routes::browser::double_click))
-        .route("/browser/drag", post(routes::browser::drag))
-        .route("/browser/move_to", post(routes::browser::move_to))
+        .route("/browser/click", post(routes::input::click))
+        .route("/browser/click_at", post(routes::input::click_at))
+        .route("/browser/click_node", post(routes::input::click_node))
+        .route("/browser/click_screen", post(routes::input::click_screen))
+        .route("/browser/double_click", post(routes::input::double_click))
+        .route("/browser/drag", post(routes::input::drag))
+        .route("/browser/move_to", post(routes::input::move_to))
         .route(
             "/browser/move_to_viewport",
-            post(routes::browser::move_to_viewport),
+            post(routes::input::move_to_viewport),
         )
-        .route("/browser/scroll", post(routes::browser::scroll))
-        .route("/browser/fill", post(routes::browser::fill))
-        .route("/browser/type", post(routes::browser::type_text))
-        .route("/browser/type_verified", post(routes::browser::type_verified))
-        .route("/browser/press", post(routes::browser::press))
-        .route("/browser/wait", post(routes::browser::wait))
-        .route("/browser/eval", post(routes::browser::eval))
-        .route("/browser/script", post(routes::browser::script))
-        .route("/browser/order", post(routes::browser::order))
-        .route("/browser/autocomplete", post(routes::browser::autocomplete))
+        .route("/browser/scroll", post(routes::input::scroll))
+        .route("/browser/fill", post(routes::input::fill))
+        .route("/browser/type", post(routes::input::type_text))
+        .route("/browser/type_verified", post(routes::input::type_verified))
+        .route("/browser/press", post(routes::input::press))
+        .route("/browser/wait", post(routes::input::wait))
+        .route("/browser/eval", post(routes::input::eval))
+        .route("/browser/script", post(routes::advanced::script))
+        .route("/browser/order", post(routes::advanced::order))
+        .route("/browser/autocomplete", post(routes::advanced::autocomplete))
         .route(
             "/browser/geometry/refresh",
-            post(routes::browser::geometry_refresh),
+            post(routes::read::geometry_refresh),
         )
-        .route("/browser/assert_visual", post(routes::browser::assert_visual))
+        .route("/browser/assert_visual", post(routes::advanced::assert_visual))
         .route(
             "/browser/screenshot/compare",
-            post(routes::browser::screenshot_compare),
+            post(routes::advanced::screenshot_compare),
         )
         .route(
             "/browser/screenshot/delta",
-            post(routes::browser::screenshot_delta),
+            post(routes::advanced::screenshot_delta),
         )
         .route(
             "/browser/screenshot/region",
-            post(routes::browser::screenshot_region),
+            post(routes::advanced::screenshot_region),
         )
-        .route("/browser/tab/new", post(routes::browser::tab_new))
-        .route("/browser/tab/switch", post(routes::browser::tab_switch))
+        .route("/browser/tab/new", post(routes::read::tab_new))
+        .route("/browser/tab/switch", post(routes::read::tab_switch))
         // New deterministic endpoints (Phase 3)
-        .route("/browser/upload", post(routes::browser::upload))
+        .route("/browser/upload", post(routes::advanced::upload))
         .route("/browser/fill_react", post(routes::browser::fill_react))
         .route("/browser/fill_date", post(routes::browser::fill_date))
         .route("/browser/paste_atomic", post(routes::browser::paste_atomic))
@@ -186,6 +198,10 @@ async fn main() -> anyhow::Result<()> {
         .layer(axum_mw::from_fn_with_state(
             state.clone(),
             middleware::body_cap_middleware,
+        ))
+        .layer(axum_mw::from_fn_with_state(
+            state.clone(),
+            middleware::lease_middleware,
         ))
         .layer(axum_mw::from_fn_with_state(
             state.clone(),
