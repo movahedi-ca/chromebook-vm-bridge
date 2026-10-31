@@ -18,6 +18,12 @@
 //!   REJECTED with an error. The driver never clicks the raw desktop.
 //!   Rejection (not clamping) is deliberate: silently moving a click target
 //!   is worse than refusing it.
+#![allow(clippy::cast_possible_truncation)] // trajectory math: f64 px -> i32 screen coords; values are range-checked before conversion
+#![allow(clippy::cast_possible_wrap)] // u32 -> i32 for X11 coords; display dimensions never exceed i32::MAX
+#![allow(clippy::cast_precision_loss)] // usize counts -> f64 for easing math; sub-pixel precision is irrelevant
+#![allow(clippy::cast_sign_loss)] // f64 distances -> usize indices; always non-negative by construction
+#![allow(clippy::many_single_char_names)] // x/y/t coordinate math follows convention
+#![allow(clippy::similar_names)] // e.g. `p`/`pts`, `x`/`xd` are distinct roles in trajectory code
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -107,8 +113,7 @@ impl XorShift64 {
     fn seeded() -> Self {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x9E3779B97F4A7C15);
+            .map_or(0x9E37_79B9_7F4A_7C15, |d| d.as_nanos() as u64);
         Self(nanos | 1)
     }
 
@@ -118,7 +123,7 @@ impl XorShift64 {
         x ^= x << 25;
         x ^= x >> 27;
         self.0 = x;
-        x.wrapping_mul(0x2545F4914F6CDD1D)
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
 
     /// Uniform in [0, 1).
@@ -233,8 +238,10 @@ fn resample_arc_length(points: &[Pt], spacing: f64) -> Vec<Pt> {
         carry += seg_len;
         prev = cur;
     }
-    if let Some(&last) = points.last() {
-        if dist(*out.last().unwrap(), last) > 1e-9 {
+    // `out` is provably non-empty here (seeded with points[0] above), but
+    // avoid unwrap in non-test code (pre-emptive hardening): pattern-match.
+    if let (Some(&last), Some(&o)) = (points.last(), out.last()) {
+        if dist(o, last) > 1e-9 {
             out.push(last);
         }
     }
@@ -332,9 +339,13 @@ pub struct X11Mouse {
 }
 
 impl X11Mouse {
-    pub fn new() -> Result<Self> {
+    /// Connect to the given X11 display. `None` falls back to the ambient
+    /// $DISPLAY (manual runs); production callers pass the configured
+    /// display so input injection can never diverge from the display the
+    /// browser was spawned on (audit 41 LOW-6).
+    pub fn new(display: Option<&str>) -> Result<Self> {
         let (conn, screen_num) =
-            RustConnection::connect(None).context("connecting to X11 display")?;
+            RustConnection::connect(display).context("connecting to X11 display")?;
         let root = conn.setup().roots[screen_num].root;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -354,7 +365,7 @@ impl X11Mouse {
         let mut r = XorShift64::seeded();
         // Mix in a per-instance counter so rapid successive calls differ.
         let salt = self.rng_salt.fetch_add(1, Ordering::Relaxed);
-        r.0 ^= salt.wrapping_mul(0x9E3779B97F4A7C15);
+        r.0 ^= salt.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         r
     }
 
@@ -370,7 +381,7 @@ impl X11Mouse {
             .context("query_pointer request")?
             .reply()
             .context("query_pointer reply")?;
-        Ok((reply.root_x as i32, reply.root_y as i32))
+        Ok((i32::from(reply.root_x), i32::from(reply.root_y)))
     }
 
     fn motion(&self, conn: &RustConnection, x: i32, y: i32) -> Result<()> {
@@ -441,7 +452,13 @@ impl X11Mouse {
             .lock()
             .map_err(|e| anyhow!("X11 mutex poisoned: {e}"))?;
         let (cx, cy) = self.query_pos(&conn)?;
-        let pts = build_trajectory(cx as f64, cy as f64, x as f64, y as f64, &mut rng);
+        let pts = build_trajectory(
+            f64::from(cx),
+            f64::from(cy),
+            f64::from(x),
+            f64::from(y),
+            &mut rng,
+        );
         self.emit_trajectory(&conn, &pts, &mut rng)
     }
 
@@ -454,7 +471,13 @@ impl X11Mouse {
             .lock()
             .map_err(|e| anyhow!("X11 mutex poisoned: {e}"))?;
         let (cx, cy) = self.query_pos(&conn)?;
-        let pts = build_trajectory(cx as f64, cy as f64, x as f64, y as f64, &mut rng);
+        let pts = build_trajectory(
+            f64::from(cx),
+            f64::from(cy),
+            f64::from(x),
+            f64::from(y),
+            &mut rng,
+        );
         self.emit_trajectory(&conn, &pts, &mut rng)?;
         thread::sleep(Duration::from_secs_f64(rng.uniform(0.05, 0.14))); // hover
         self.button(&conn, true, 1)?;
@@ -476,7 +499,13 @@ impl X11Mouse {
             .lock()
             .map_err(|e| anyhow!("X11 mutex poisoned: {e}"))?;
         let (cx, cy) = self.query_pos(&conn)?;
-        let pts = build_trajectory(cx as f64, cy as f64, x as f64, y as f64, &mut rng);
+        let pts = build_trajectory(
+            f64::from(cx),
+            f64::from(cy),
+            f64::from(x),
+            f64::from(y),
+            &mut rng,
+        );
         self.emit_trajectory(&conn, &pts, &mut rng)?;
         thread::sleep(Duration::from_secs_f64(rng.uniform(0.05, 0.12)));
         self.button(&conn, true, 1)?;
@@ -504,7 +533,13 @@ impl X11Mouse {
             .map_err(|e| anyhow!("X11 mutex poisoned: {e}"))?;
         // Move to start.
         let (cx, cy) = self.query_pos(&conn)?;
-        let to_start = build_trajectory(cx as f64, cy as f64, x1 as f64, y1 as f64, &mut rng);
+        let to_start = build_trajectory(
+            f64::from(cx),
+            f64::from(cy),
+            f64::from(x1),
+            f64::from(y1),
+            &mut rng,
+        );
         self.emit_trajectory(&conn, &to_start, &mut rng)?;
 
         thread::sleep(Duration::from_secs_f64(rng.uniform(0.05, 0.14)));
@@ -512,11 +547,17 @@ impl X11Mouse {
         thread::sleep(Duration::from_secs_f64(rng.uniform(0.04, 0.09)));
 
         // Trace the stroke with sinusoidal hand wobble.
-        let stroke = build_trajectory(x1 as f64, y1 as f64, x2 as f64, y2 as f64, &mut rng);
+        let stroke = build_trajectory(
+            f64::from(x1),
+            f64::from(y1),
+            f64::from(x2),
+            f64::from(y2),
+            &mut rng,
+        );
         let total = polyline_len(&stroke).max(1.0);
         let wob_phase = rng.uniform(0.0, std::f64::consts::TAU);
-        let seg_ang =
-            (y2 as f64 - y1 as f64).atan2(x2 as f64 - x1 as f64) + std::f64::consts::FRAC_PI_2;
+        let seg_ang = (f64::from(y2) - f64::from(y1)).atan2(f64::from(x2) - f64::from(x1))
+            + std::f64::consts::FRAC_PI_2;
         let (wx, wy) = (seg_ang.cos(), seg_ang.sin());
         // Draw at ~750 px/s like the legacy driver.
         let step_time = (RESAMPLE_SPACING_PX / 750.0).max(0.002);
@@ -632,6 +673,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assert_is_empty)] // is_empty() is clearer than assert_ne! against an empty array literal
     fn arc_length_uniform() {
         // Resampled segments should have low variance: uniform spacing.
         let mut rng = XorShift64::seeded();
@@ -666,7 +708,7 @@ mod tests {
     #[test]
     fn smoothness_score_sanity() {
         // Straight line: no turning, no deviation.
-        let line: Vec<Pt> = (0..=10).map(|i| (i as f64 * 10.0, 0.0)).collect();
+        let line: Vec<Pt> = (0..=10).map(|i| (f64::from(i) * 10.0, 0.0)).collect();
         let (turn, dev) = X11Mouse::smoothness_score(&line);
         assert!(turn < 1e-6, "straight line turn={turn}");
         assert!(dev < 1e-6, "straight line dev={dev}");
@@ -697,7 +739,7 @@ mod tests {
         let total = polyline_len(&pts);
         let mut prev = -1.0;
         for i in 0..=20 {
-            let t = i as f64 / 20.0;
+            let t = f64::from(i) / 20.0;
             let p = point_at_distance(&pts, smoothstep(t) * total);
             assert!(p.0 >= prev - 1e-9, "eased distance went backwards");
             prev = p.0;
