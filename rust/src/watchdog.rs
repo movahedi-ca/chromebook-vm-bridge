@@ -121,7 +121,9 @@ async fn probe_browser(
     }
 }
 
-/// Relaunch the browser. Called with WATCHDOG=1 already pinged.
+/// Mark the browser dead so the supervisor respawns it. Called with
+/// WATCHDOG=1 already pinged. The supervisor owns the relaunch itself
+/// (and the `relaunches` metric); this only flips the state.
 async fn trigger_relaunch(state: SharedState) {
     if state.shutting_down.load(Ordering::SeqCst) {
         return;
@@ -130,9 +132,7 @@ async fn trigger_relaunch(state: SharedState) {
         let mut b = state.browser1.lock().await;
         b.mark_dead();
     }
-    // The actual launch happens in browser::launch (Phase 2).
-    // For now, mark for launch; the next /browser/* call or watchdog
-    // tick will trigger it via ensure_browser().
-    tracing::info!("browser marked for relaunch");
-    state.metrics.lock().await.relaunches += 1;
+    // The supervisor's loop notices the dead browser on its next tick and
+    // respawns with capped backoff.
+    tracing::info!("browser marked for relaunch (supervisor will respawn)");
 }
