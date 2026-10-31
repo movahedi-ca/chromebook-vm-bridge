@@ -247,3 +247,278 @@ mod tests {
         assert!(DIFF_FLUSH_JS.contains("mutated"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Unified PNG decode / pixel-diff / dHash pipeline (visual routes).
+//
+// Previously `screenshot_compare` and `screenshot_delta` in
+// `routes/advanced.rs` each decoded the current frame twice (once for the
+// diff, once for the dHash/patch) and cloned the whole PNG `Vec<u8>` to
+// move it into a second `spawn_blocking`. `compare_frames` below does one
+// decode of each input, one row-major diff, one in-memory hash, and one
+// optional patch crop inside a SINGLE `spawn_blocking` closure.
+//
+// Score semantics are unchanged: `score` is 1.0 for identical frames
+// (`is_match = score >= 0.99` in the routes), `bbox` is inclusive-exclusive.
+
+/// Pixel-count cap (audit 42 MED-6): a crafted PNG can declare enormous
+/// dimensions (decompression bomb). Read the header only and refuse
+/// anything over 64 MP before allocating the bitmap.
+pub const MAX_PIXELS: u64 = 64_000_000;
+
+/// Decode a PNG with the pixel cap enforced. Single decode site for the
+/// visual pipeline; the 64 MP header check replaces ad-hoc per-route caps.
+pub fn decode_png_capped(png: &[u8]) -> anyhow::Result<image::RgbImage> {
+    let dims = image::ImageReader::new(std::io::Cursor::new(png))
+        .with_guessed_format()
+        .map_err(|e| anyhow::anyhow!("png header: {e}"))?
+        .into_dimensions()
+        .map_err(|e| anyhow::anyhow!("png dimensions: {e}"))?;
+    let pixels = u64::from(dims.0).saturating_mul(u64::from(dims.1));
+    if pixels > MAX_PIXELS {
+        anyhow::bail!("image exceeds pixel cap ({pixels} > {MAX_PIXELS})");
+    }
+    image::load_from_memory(png)
+        .map_err(|e| anyhow::anyhow!("png decode: {e}"))
+        .map(|img| img.to_rgb8())
+}
+
+/// dHash from an in-memory frame — no re-decode. Bit-exact with the
+/// historical `browser::verify::dhash` for RGB input: 9x8 Nearest luma,
+/// LSB-first bit order (`hash |= 1 << (y * 8 + x)`). Both now share this
+/// implementation, so `/browser/screenshot/hash` and `screenshot_compare`
+/// can never disagree on the same frame (audit 41 MED-3).
+pub fn dhash_rgb(img: &image::RgbImage) -> u64 {
+    let gray = image::imageops::grayscale(img);
+    let small = image::imageops::resize(&gray, 9, 8, image::imageops::FilterType::Nearest);
+    let mut hash = 0u64;
+    for y in 0..8u32 {
+        for x in 0..8u32 {
+            if small.get_pixel(x, y)[0] > small.get_pixel(x + 1, y)[0] {
+                hash |= 1 << (y * 8 + x);
+            }
+        }
+    }
+    hash
+}
+
+/// Encode an `RgbImage` as PNG bytes.
+pub fn png_bytes(img: &image::RgbImage) -> anyhow::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    image::DynamicImage::ImageRgb8(img.clone())
+        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+        .map_err(|e| anyhow::anyhow!("PNG encode failed: {e}"))?;
+    Ok(buf)
+}
+
+/// Row-major pixel diff with a `memcmp` fast path.
+///
+/// A pixel counts as changed when its maximum per-channel absolute
+/// difference exceeds `threshold`. Rows are compared with SIMD-accelerated
+/// slice equality first, so unchanged scanlines are skipped at
+/// memory-bandwidth speed; only changed rows pay the per-pixel loop.
+/// Diff outcome: `(changed_pixels, total_pixels, bbox)` with the bbox in
+/// inclusive-exclusive `(x0, y0, x1, y1)` form.
+type RgbDiffOutcome = (u64, u64, Option<(u32, u32, u32, u32)>);
+
+/// Returns `(changed_pixels, total_pixels, bbox)` with the bbox in
+/// inclusive-exclusive `(x0, y0, x1, y1)` form. Both images must have
+/// identical dimensions (the caller resizes the reference).
+fn diff_rgb_buffers(
+    cur: &image::RgbImage,
+    reference: &image::RgbImage,
+    threshold: u8,
+) -> RgbDiffOutcome {
+    let (w, h) = cur.dimensions();
+    debug_assert_eq!((w, h), reference.dimensions());
+    if w == 0 || h == 0 {
+        return (0, 0, None);
+    }
+    let row_stride = (w as usize) * 3;
+    let cur_raw = cur.as_raw();
+    let ref_raw = reference.as_raw();
+    let mut changed = 0u64;
+    let mut min_x = w;
+    let mut min_y = h;
+    let mut max_x = 0u32;
+    let mut max_y = 0u32;
+    for (y, (cur_row, ref_row)) in cur_raw
+        .chunks_exact(row_stride)
+        .zip(ref_raw.chunks_exact(row_stride))
+        .enumerate()
+    {
+        // Fast path: identical rows never enter the pixel loop.
+        if cur_row == ref_row {
+            continue;
+        }
+        let mut row_changed = false;
+        for (x, (c_px, r_px)) in cur_row
+            .chunks_exact(3)
+            .zip(ref_row.chunks_exact(3))
+            .enumerate()
+        {
+            let d = c_px[0]
+                .abs_diff(r_px[0])
+                .max(c_px[1].abs_diff(r_px[1]))
+                .max(c_px[2].abs_diff(r_px[2]));
+            if d > threshold {
+                changed += 1;
+                row_changed = true;
+                let x_u32 = x as u32;
+                if x_u32 < min_x {
+                    min_x = x_u32;
+                }
+                if x_u32 + 1 > max_x {
+                    max_x = x_u32 + 1;
+                }
+            }
+        }
+        if row_changed {
+            let y_u32 = y as u32;
+            if y_u32 < min_y {
+                min_y = y_u32;
+            }
+            if y_u32 + 1 > max_y {
+                max_y = y_u32 + 1;
+            }
+        }
+    }
+    let bbox = if changed > 0 {
+        Some((min_x, min_y, max_x, max_y))
+    } else {
+        None
+    };
+    (changed, u64::from(w) * u64::from(h), bbox)
+}
+
+/// One-shot visual comparison: decode each input ONCE, diff, hash the
+/// current frame from memory, and optionally crop the changed patch.
+///
+/// Replaces the old split flow (diff in one `spawn_blocking`, dHash in a
+/// second, patch crop re-decoding the frame a third time). `want_patch`
+/// pads the bbox by 4 px and PNG-encodes only the changed region;
+/// `patch_png` is empty when nothing changed or `want_patch` is false.
+pub struct FrameDiff {
+    /// 1.0 = identical frames (routes use `score >= 0.99` as "match").
+    pub score: f64,
+    pub changed: u64,
+    pub total: u64,
+    /// Inclusive-exclusive `(x0, y0, x1, y1)`; `None` when identical.
+    pub bbox: Option<(u32, u32, u32, u32)>,
+    /// dHash of the CURRENT frame, from the in-memory bitmap.
+    pub hash: u64,
+    /// PNG bytes of the 4 px-padded changed region; empty if none.
+    pub patch_png: Vec<u8>,
+}
+
+pub fn compare_frames(
+    current_png: &[u8],
+    reference_png: &[u8],
+    threshold: u8,
+    want_patch: bool,
+) -> anyhow::Result<FrameDiff> {
+    let cur = decode_png_capped(current_png)
+        .map_err(|e| anyhow::anyhow!("cannot decode current screenshot: {e}"))?;
+    let mut rf = decode_png_capped(reference_png)
+        .map_err(|e| anyhow::anyhow!("cannot decode reference image: {e}"))?;
+    if rf.dimensions() != cur.dimensions() {
+        rf = image::imageops::resize(
+            &rf,
+            cur.width(),
+            cur.height(),
+            image::imageops::FilterType::Triangle,
+        );
+    }
+    let (changed, total, bbox) = diff_rgb_buffers(&cur, &rf, threshold);
+    let score = if total == 0 {
+        1.0
+    } else {
+        1.0 - changed as f64 / total as f64
+    };
+    let hash = dhash_rgb(&cur);
+    let patch_png = if want_patch {
+        match bbox {
+            None => Vec::new(),
+            Some((x0, y0, x1, y1)) => {
+                let (w, h) = cur.dimensions();
+                let px0 = x0.saturating_sub(4);
+                let py0 = y0.saturating_sub(4);
+                let px1 = (x1 + 4).min(w);
+                let py1 = (y1 + 4).min(h);
+                if px1 <= px0 || py1 <= py0 {
+                    Vec::new()
+                } else {
+                    let patch =
+                        image::imageops::crop_imm(&cur, px0, py0, px1 - px0, py1 - py0).to_image();
+                    png_bytes(&patch)?
+                }
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    Ok(FrameDiff {
+        score,
+        changed,
+        total,
+        bbox,
+        hash,
+        patch_png,
+    })
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+
+    fn solid_png(w: u32, h: u32, r: u8, g: u8, b: u8) -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(w, h, image::Rgb([r, g, b]));
+        png_bytes(&img).unwrap()
+    }
+
+    #[test]
+    fn pipeline_identical_scores_one() {
+        let a = solid_png(8, 8, 200, 200, 200);
+        let d = compare_frames(&a, &a, 10, false).unwrap();
+        assert!((d.score - 1.0).abs() < f64::EPSILON);
+        assert_eq!(d.changed, 0);
+        assert!(d.bbox.is_none());
+        assert!(d.patch_png.is_empty());
+        assert_eq!(d.hash, dhash_rgb(&decode_png_capped(&a).unwrap()));
+    }
+
+    #[test]
+    fn pipeline_finds_changed_bbox_and_patch() {
+        let a = solid_png(8, 8, 200, 200, 200);
+        let mut img = image::RgbImage::from_pixel(8, 8, image::Rgb([200, 200, 200]));
+        img.put_pixel(2, 3, image::Rgb([0, 0, 0]));
+        let b = png_bytes(&img).unwrap();
+        let d = compare_frames(&b, &a, 10, true).unwrap();
+        assert_eq!(d.changed, 1);
+        assert_eq!(d.bbox, Some((2, 3, 3, 4)));
+        assert!(d.score < 1.0 && d.score > 0.9);
+        assert!(!d.patch_png.is_empty());
+    }
+
+    #[test]
+    fn pipeline_resizes_mismatched_reference() {
+        let a = solid_png(8, 8, 200, 200, 200);
+        let b = solid_png(4, 4, 200, 200, 200);
+        let d = compare_frames(&a, &b, 10, false).unwrap();
+        assert!((d.score - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn pipeline_rejects_undecodable() {
+        let a = solid_png(8, 8, 200, 200, 200);
+        assert!(compare_frames(&a, b"not png", 10, false).is_err());
+        assert!(compare_frames(b"not png", &a, 10, false).is_err());
+    }
+
+    #[test]
+    fn dhash_deterministic_on_rgb() {
+        let a = solid_png(16, 16, 200, 200, 200);
+        let img = decode_png_capped(&a).unwrap();
+        assert_eq!(dhash_rgb(&img), dhash_rgb(&img));
+    }
+}
