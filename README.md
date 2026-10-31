@@ -43,10 +43,12 @@ land.
 | `/browser/restore_checkpoint`, `/browser/vault_login` | stub (501) — FormGuard is parked (see `rust/src/browser/tabs.rs`) |
 | `/browser/som_screenshot`, `/browser/diff_state` | stub (501) |
 
-MCP (`--mcp-stdio`, 10 tools): `tabs` and `upload` are functional;
-`navigate` validates the URL only; `snapshot`, `diff`, `click_ref`,
-`fill_ref`, `order`, `screenshot_marks`, and `eval` currently return
-guidance errors pointing at the equivalent HTTP endpoints.
+MCP (`--mcp-stdio`, 10 tools): `tabs`, `upload`, and `navigate` are
+functional — `navigate` validates the URL (same SSRF firewall as the HTTP
+API) and performs the navigation on the supervised browser (audit 41
+LOW-4: the README used to claim it validated only). `snapshot`, `diff`,
+`click_ref`, `fill_ref`, `order`, `screenshot_marks`, and `eval` currently
+return guidance errors pointing at the equivalent HTTP endpoints.
 
 ## Files
 
