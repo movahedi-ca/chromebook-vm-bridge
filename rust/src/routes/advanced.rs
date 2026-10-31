@@ -87,7 +87,7 @@ fn b64_val(c: u8) -> Option<u8> {
     }
 }
 
-fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
     let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     if !bytes.len().is_multiple_of(4) {
         return Err("bad base64: length is not a multiple of 4".to_string());
@@ -185,86 +185,6 @@ fn clip_viewport(x: f64, y: f64, width: f64, height: f64) -> anyhow::Result<View
         .scale(1.0)
         .build()
         .map_err(|e| anyhow::anyhow!("clip viewport: {e}"))
-}
-
-// ---------------------------------------------------------------------------
-// Pixel comparison
-// ---------------------------------------------------------------------------
-
-struct DiffResult {
-    /// Fraction of pixels within tolerance: 1.0 = identical.
-    score: f64,
-    changed: u64,
-    #[allow(dead_code)] // reported by a future diff endpoint; score+changed suffice today
-    total: u64,
-    /// Bounding box of changed pixels (x0, y0, x1, y1, inclusive-exclusive).
-    bbox: Option<(u32, u32, u32, u32)>,
-}
-
-/// Compare two PNGs pixel-wise. The reference is resized to the current
-/// frame when sizes differ. A pixel counts as changed when its maximum
-/// per-channel absolute difference exceeds `threshold`.
-#[allow(clippy::cast_precision_loss)] // u64 pixel counts -> f64 ratio; sub-pixel precision irrelevant
-#[allow(clippy::many_single_char_names)] // pixel loops: x/y/w/h/a/b are conventional
-fn diff_images(
-    current_png: &[u8],
-    reference_png: &[u8],
-    threshold: u8,
-) -> anyhow::Result<DiffResult> {
-    let cur = image::load_from_memory(current_png)
-        .map_err(|e| anyhow::anyhow!("cannot decode current screenshot: {e}"))?
-        .to_rgb8();
-    let mut rf = image::load_from_memory(reference_png)
-        .map_err(|e| anyhow::anyhow!("cannot decode reference image: {e}"))?
-        .to_rgb8();
-    if rf.dimensions() != cur.dimensions() {
-        rf = image::imageops::resize(
-            &rf,
-            cur.width(),
-            cur.height(),
-            image::imageops::FilterType::Triangle,
-        );
-    }
-    let (w, h) = cur.dimensions();
-    let total = u64::from(w) * u64::from(h);
-    let mut changed = 0u64;
-    let mut bbox: Option<(u32, u32, u32, u32)> = None;
-    for y in 0..h {
-        for x in 0..w {
-            let a = cur.get_pixel(x, y);
-            let b = rf.get_pixel(x, y);
-            let d = a[0]
-                .abs_diff(b[0])
-                .max(a[1].abs_diff(b[1]))
-                .max(a[2].abs_diff(b[2]));
-            if d > threshold {
-                changed += 1;
-                bbox = Some(match bbox {
-                    None => (x, y, x + 1, y + 1),
-                    Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1)),
-                });
-            }
-        }
-    }
-    let score = if total == 0 {
-        1.0
-    } else {
-        1.0 - changed as f64 / total as f64
-    };
-    Ok(DiffResult {
-        score,
-        changed,
-        total,
-        bbox,
-    })
-}
-
-fn png_bytes(img: &image::RgbImage) -> anyhow::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    image::DynamicImage::ImageRgb8(img.clone())
-        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
-        .map_err(|e| anyhow::anyhow!("PNG encode failed: {e}"))?;
-    Ok(buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -569,7 +489,7 @@ pub async fn order(
                 .map_err(|_| anyhow::anyhow!("visible click timed out"))??;
                 Ok::<_, anyhow::Error>("visible")
             } else {
-                mouse_click(page, x, y).await?;
+                mouse_click(page, x, y, state.click_timing()).await?;
                 Ok("native")
             }
         }
@@ -656,7 +576,7 @@ pub async fn autocomplete(
             )
         }
     };
-    if let Err(e) = mouse_click(&page, x, y).await {
+    if let Err(e) = mouse_click(&page, x, y, state.click_timing()).await {
         return err(StatusCode::BAD_GATEWAY, format!("focus click failed: {e}"));
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -732,7 +652,7 @@ pub async fn autocomplete(
             )
         }
     };
-    if let Err(e) = mouse_click(&page, ox, oy).await {
+    if let Err(e) = mouse_click(&page, ox, oy, state.click_timing()).await {
         return err(StatusCode::BAD_GATEWAY, format!("option click failed: {e}"));
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -775,30 +695,34 @@ pub struct ScriptRequest {
 }
 
 /// Run one script step against the active page.
-async fn run_script_step(page: &Page, step: &ScriptStep) -> anyhow::Result<serde_json::Value> {
+async fn run_script_step(
+    page: &Page,
+    step: &ScriptStep,
+    timing: crate::browser::actions::ClickTiming,
+) -> anyhow::Result<serde_json::Value> {
     let action = step.action.trim().to_lowercase();
     match action.as_str() {
         "click" => {
             let (x, y) = element_center(page, &step.selector).await?;
-            mouse_click(page, x, y).await?;
+            mouse_click(page, x, y, timing).await?;
             Ok(json!({"ok": true, "action": "click", "at": {"x": x.round(), "y": y.round()}}))
         }
         "fill" => {
             let (x, y) = element_center(page, &step.selector).await?;
-            mouse_click(page, x, y).await?;
+            mouse_click(page, x, y, timing).await?;
             fill_focused(page, &step.text).await?;
             Ok(json!({"ok": true, "action": "fill"}))
         }
         "type" => {
             let (x, y) = element_center(page, &step.selector).await?;
-            mouse_click(page, x, y).await?;
+            mouse_click(page, x, y, timing).await?;
             insert_text(page, &step.text).await?;
             Ok(json!({"ok": true, "action": "type"}))
         }
         "press" => {
             if !step.selector.is_empty() {
                 let (x, y) = element_center(page, &step.selector).await?;
-                mouse_click(page, x, y).await?;
+                mouse_click(page, x, y, timing).await?;
             }
             press_key(page, &step.key).await?;
             Ok(json!({"ok": true, "action": "press", "key": step.key}))
@@ -864,7 +788,12 @@ pub async fn script(
     };
     let mut results = Vec::with_capacity(req.steps.len());
     for (i, step) in req.steps.iter().enumerate() {
-        match tokio::time::timeout(Duration::from_secs(60), run_script_step(&page, step)).await {
+        match tokio::time::timeout(
+            Duration::from_secs(60),
+            run_script_step(&page, step, state.click_timing()),
+        )
+        .await
+        {
             Ok(Ok(r)) => results.push(r),
             Ok(Err(e)) => {
                 return ok_json(json!({"ok": false, "error": e.to_string(), "step": i}));
@@ -1038,12 +967,12 @@ pub async fn screenshot_compare(
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_GATEWAY, e.to_string()),
     };
-    // CPU-bound pixel work runs on the blocking pool, never the async
-    // runtime (audit 40 MED-6). Clone the frame: `png` is still needed
-    // below for the perceptual hash.
-    let png_for_diff = png.clone();
+    // Unified visual pipeline (perception::diff): ONE spawn_blocking that
+    // decodes each frame once, diffs, and hashes from the in-memory bitmap.
+    // Previously this cloned the PNG vec, decoded the current frame twice
+    // (diff + dhash), and ran two blocking tasks.
     let diff = match tokio::task::spawn_blocking(move || {
-        diff_images(&png_for_diff, &reference, threshold)
+        crate::perception::diff::compare_frames(&png, &reference, threshold, false)
     })
     .await
     {
@@ -1051,10 +980,6 @@ pub async fn screenshot_compare(
         Ok(Err(e)) => return err(StatusCode::BAD_REQUEST, e.to_string()),
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("diff task: {e}")),
     };
-    // dhash decodes the frame too: blocking pool as well.
-    let hash = tokio::task::spawn_blocking(move || crate::browser::verify::dhash(&png))
-        .await
-        .unwrap_or(0);
     // A <1% changed-pixel budget absorbs caret blinks and antialiasing;
     // anything beyond that counts as a real visual change.
     let is_match = diff.score >= 0.99;
@@ -1064,7 +989,7 @@ pub async fn screenshot_compare(
         "score": diff.score,
         "diff_pct": (1.0 - diff.score) * 100.0,
         "changed_pixels": diff.changed,
-        "hash": hash,
+        "hash": diff.hash,
     }))
 }
 
@@ -1100,10 +1025,8 @@ pub async fn screenshot_delta(
     // CPU-bound pixel work (diff + patch decode/crop) runs on the blocking
     // pool, never the async runtime (audit 40 MED-6; proactive-1: the patch
     // decode/crop used to run on the handler thread after the diff task).
-    enum DeltaErr {
-        Diff(String),
-        Capture(String),
-    }
+    // The unified `perception::diff::compare_frames` pipeline decodes each
+    // frame once inside this single closure.
     let _ = req.session_id; // contract field; see struct docs
     let _ = req.quality; // contract field; patches are PNG, see struct docs
     if req.reference_b64.trim().is_empty() {
@@ -1127,51 +1050,28 @@ pub async fn screenshot_delta(
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_GATEWAY, e.to_string()),
     };
-    let (diff, patch_b64) =
-        match tokio::task::spawn_blocking(move || -> Result<(DiffResult, String), DeltaErr> {
-            let diff = diff_images(&png, &reference, threshold)
-                .map_err(|e| DeltaErr::Diff(e.to_string()))?;
-            let patch_b64 = match diff.bbox {
-                None => String::new(),
-                Some((x0, y0, x1, y1)) => {
-                    // Pad slightly so patch edges composite cleanly.
-                    let cur = image::load_from_memory(&png)
-                        .map_err(|e| DeltaErr::Capture(format!("decode capture: {e}")))?
-                        .to_rgb8();
-                    let (w, h) = cur.dimensions();
-                    let px0 = x0.saturating_sub(4);
-                    let py0 = y0.saturating_sub(4);
-                    let px1 = (x1 + 4).min(w);
-                    let py1 = (y1 + 4).min(h);
-                    if px1 <= px0 || py1 <= py0 {
-                        String::new()
-                    } else {
-                        let patch = image::imageops::crop_imm(&cur, px0, py0, px1 - px0, py1 - py0)
-                            .to_image();
-                        png_bytes(&patch)
-                            .map(|b| base64_encode(&b))
-                            .map_err(|e| DeltaErr::Capture(e.to_string()))?
-                    }
-                }
-            };
-            Ok((diff, patch_b64))
-        })
-        .await
-        {
-            Ok(Ok((diff, patch_b64))) => (diff, patch_b64),
-            Ok(Err(DeltaErr::Diff(e))) => return err(StatusCode::BAD_REQUEST, e),
-            Ok(Err(DeltaErr::Capture(e))) => return err(StatusCode::BAD_GATEWAY, e),
-            Err(e) => {
-                return err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("delta task: {e}"),
-                )
-            }
-        };
+    // Unified visual pipeline (perception::diff): ONE spawn_blocking that
+    // decodes each frame once, diffs, and crops the patch from the
+    // in-memory bitmap. Previously the frame was decoded twice (diff +
+    // patch crop).
+    let diff = match tokio::task::spawn_blocking(move || {
+        crate::perception::diff::compare_frames(&png, &reference, threshold, true)
+    })
+    .await
+    {
+        Ok(Ok(d)) => d,
+        Ok(Err(e)) => return err(StatusCode::BAD_REQUEST, e.to_string()),
+        Err(e) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("delta task: {e}"),
+            )
+        }
+    };
     ok_json(json!({
         "ok": true,
         "changed": diff.bbox.is_some(),
-        "patch_b64": patch_b64,
+        "patch_b64": base64_encode(&diff.patch_png),
     }))
 }
 
@@ -1428,13 +1328,13 @@ mod tests {
     /// Encode a solid-color RGB PNG for diff tests.
     fn solid_png(w: u32, h: u32, r: u8, g: u8, b: u8) -> Vec<u8> {
         let img = image::RgbImage::from_pixel(w, h, image::Rgb([r, g, b]));
-        png_bytes(&img).unwrap()
+        crate::perception::diff::png_bytes(&img).unwrap()
     }
 
     #[test]
     fn diff_identical_scores_one() {
         let a = solid_png(8, 8, 200, 200, 200);
-        let d = diff_images(&a, &a, 10).unwrap();
+        let d = crate::perception::diff::compare_frames(&a, &a, 10, false).unwrap();
         assert!((d.score - 1.0).abs() < f64::EPSILON);
         assert_eq!(d.changed, 0);
         assert!(d.bbox.is_none());
@@ -1445,8 +1345,8 @@ mod tests {
         let a = solid_png(8, 8, 200, 200, 200);
         let mut img = image::RgbImage::from_pixel(8, 8, image::Rgb([200, 200, 200]));
         img.put_pixel(2, 3, image::Rgb([0, 0, 0]));
-        let b = png_bytes(&img).unwrap();
-        let d = diff_images(&a, &b, 10).unwrap();
+        let b = crate::perception::diff::png_bytes(&img).unwrap();
+        let d = crate::perception::diff::compare_frames(&a, &b, 10, false).unwrap();
         assert_eq!(d.changed, 1);
         assert_eq!(d.bbox, Some((2, 3, 3, 4)));
         assert!(d.score < 1.0 && d.score > 0.9);
@@ -1456,14 +1356,14 @@ mod tests {
     fn diff_resizes_mismatched_reference() {
         let a = solid_png(8, 8, 200, 200, 200);
         let b = solid_png(4, 4, 200, 200, 200);
-        let d = diff_images(&a, &b, 10).unwrap();
+        let d = crate::perception::diff::compare_frames(&a, &b, 10, false).unwrap();
         assert!((d.score - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn diff_rejects_undecodable() {
         let a = solid_png(8, 8, 200, 200, 200);
-        assert!(diff_images(&a, b"not png", 10).is_err());
+        assert!(crate::perception::diff::compare_frames(&a, b"not png", 10, false).is_err());
     }
 
     #[test]
