@@ -108,6 +108,20 @@ impl TabRegistry {
         self.active_id = None;
     }
 
+    /// Record a verification baseline hash for a tab (audit 41 MED-4).
+    /// Called once navigation settles; a failed/uncapturable baseline
+    /// leaves None (unknown), which is honest — never a false match.
+    /// Returns false when the tab id is unknown (evicted mid-flight).
+    pub fn set_baseline(&mut self, id: &str, hash: u64) -> bool {
+        match self.tabs.get_mut(id) {
+            Some(e) => {
+                e.baseline_hash = Some(hash);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn list(&self) -> Vec<TabSummary> {
         self.tabs
             .iter()
@@ -129,7 +143,7 @@ pub struct TabSummary {
     pub active: bool,
 }
 
-/// Rate-limiter buckets keyed by (client_identity, raw_path).
+/// Rate-limiter buckets keyed by (`client_identity`, `raw_path`).
 ///
 /// NOTE: the rate-limit middleware runs as a `Router::layer`, i.e. BEFORE
 /// route matching, so `MatchedPath` is never populated there and the key
@@ -137,9 +151,12 @@ pub struct TabSummary {
 /// 404-scan path variants is contained by idle-bucket eviction in the
 /// middleware (cap 10k entries, 120s idle TTL).
 ///
-/// client_identity is a hash of the presented `x-api-key` when present
-/// (all production clients share one tailnet tunnel IP — IP keying would
-/// let one client's burst throttle everyone else), else the socket IP.
+/// `client_identity` is the client socket IP (see
+/// `middleware::client_identity)`: the presented `x-api-key` is UNVERIFIED at
+/// that layer (auth runs after), so keying on it would let a brute-forcer
+/// rotate keys for a fresh bucket per request. Key rotation does not reset
+/// buckets. (Audit 41 LOW-3: an older comment here claimed key-hash
+/// identity; the code has used socket IP since audit 40 HIGH-3.)
 pub type RateBuckets = HashMap<
     (String, String),
     (
@@ -181,6 +198,9 @@ pub struct BridgeState {
     pub x11: StdMutex<Option<x11rb::rust_connection::RustConnection>>,
     /// Shutdown flag for graceful teardown (audit BUG-4)
     pub shutting_down: std::sync::atomic::AtomicBool,
+    /// Process start time, for honest /health uptime reporting (audit 41
+    /// MED-2 — `uptime_s` used to report wall-clock epoch seconds).
+    pub started_at: std::time::Instant,
     /// Lease ID for internal bypass (empty = no bypass)
     #[allow(dead_code)] // parked: internal bypass not yet enforced anywhere (audit LOW-1)
     pub internal_token: String,
@@ -198,6 +218,7 @@ impl BridgeState {
             ax_mappers: Mutex::new(HashMap::new()),
             x11: StdMutex::new(None),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
+            started_at: std::time::Instant::now(),
             internal_token: Uuid::new_v4().to_string(),
             config,
         }
