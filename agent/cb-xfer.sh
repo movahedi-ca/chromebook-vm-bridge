@@ -64,18 +64,22 @@ if [ "$mode" = "push" ]; then
   export CB_AUDIT_CMD="xfer:push"
   [ -e "$src" ] || fail "local source missing: $src"
   if [ -d "$src" ]; then
-    kind=dir; lroot="$src"; rsrc="$src/"; rroot="$dst"  # dir: sync contents into dst
+    kind="dir"; lroot="$src"; rsrc="$src/"; rroot="$dst"  # dir: sync contents into dst
   else
-    kind=file; lroot="$src"; rsrc="$src"; rroot="$dst"
+    kind="file"; lroot="$src"; rsrc="$src"; rroot="$dst"
   fi
   # Transfer-level retry (see pull branch): safe and idempotent via
   # --partial --checksum.
   attempt=1
   while :; do
-    if rsync -a --checksum --partial --compress -e "$CB_SSH" -- "$rsrc" "$HOST:$dst"; then
+    # NOTE: capture rsync's status directly — `rc=$?` after an `if` would
+    # read the if-statement's status (0 when the condition is false), not
+    # rsync's (proactive-4).
+    rsync -a --checksum --partial --compress -e "$CB_SSH" -- "$rsrc" "$HOST:$dst"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
       break
     fi
-    rc=$?
     if [ "$attempt" -ge 3 ]; then fail "rsync push failed after $attempt attempts (last exit $rc)"; fi
     sleep_ms=$(( 1000 * attempt + RANDOM % 1000 ))
     sleep "$(awk -v ms="$sleep_ms" 'BEGIN{printf "%.3f", ms/1000}')"
@@ -92,10 +96,12 @@ else
   kind="$rkind"
   attempt=1
   while :; do
-    if rsync -a --checksum --partial --compress -e "$CB_SSH" -- "$HOST:$src" "$dst"; then
+    # NOTE: see push branch — capture rsync's status directly (proactive-4).
+    rsync -a --checksum --partial --compress -e "$CB_SSH" -- "$HOST:$src" "$dst"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
       break
     fi
-    rc=$?
     if [ "$attempt" -ge 3 ]; then fail "rsync pull failed after $attempt attempts (last exit $rc)"; fi
     sleep_ms=$(( 1000 * attempt + RANDOM % 1000 ))
     sleep "$(awk -v ms="$sleep_ms" 'BEGIN{printf "%.3f", ms/1000}')"
