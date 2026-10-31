@@ -43,6 +43,18 @@ pub struct Config {
     #[allow(dead_code)] // retention enforcement not built yet
     pub artifact_ttl_hours: u64,
 
+    /// CDP click timing profile: "normal" (30/40 ms — current behavior) or
+    /// "fast" (5/10 ms). Env: VM_BRIDGE_INTERACTION_PROFILE.
+    #[serde(default = "default_interaction_profile")]
+    pub interaction_profile: String,
+
+    /// Opt-in URL patterns blocked inside Chromium's network service via
+    /// `Network.setBlockedURLs` (e.g. ad/tracker hosts for faster page
+    /// loads). Empty (default) = off. Env:
+    /// `VM_BRIDGE_BLOCKED_RESOURCE_PATTERNS` (comma-separated).
+    #[serde(default)]
+    pub blocked_resource_patterns: Vec<String>,
+
     /// Upload staging allowlist
     pub upload_dirs: Vec<PathBuf>,
 
@@ -66,6 +78,12 @@ pub struct ApiKeys {
     /// Admin: /browser/eval, /pool/eval, /ops/*
     #[serde(default)]
     pub admin: String,
+}
+
+/// Default `interaction_profile`: "normal" preserves the historical
+/// 30/40 ms CDP click sleeps exactly.
+fn default_interaction_profile() -> String {
+    "normal".to_string()
 }
 
 impl Config {
@@ -95,7 +113,9 @@ impl Config {
             .set_default("max_body_bytes", 8 * 1024 * 1024)?
             .set_default("max_decompressed_bytes", 8 * 1024 * 1024)?
             .set_default("max_artifacts", 50)?
-            .set_default("artifact_ttl_hours", 24)?;
+            .set_default("artifact_ttl_hours", 24)?
+            .set_default("interaction_profile", "normal")?
+            .set_default("blocked_resource_patterns", Vec::<String>::new())?;
 
         // Resolve paths (no hardcoded /home/auto)
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
