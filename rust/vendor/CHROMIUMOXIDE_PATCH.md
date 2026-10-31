@@ -19,7 +19,9 @@ event killed the CDP connection ("oneshot canceled", bridge deaf) on any real
 page load. Upstream has no release with a fix; vendoring was the pragmatic
 unblock.
 
-## The local change (`src/conn.rs`, `chromiumoxide-conn.patch`)
+## The local changes
+
+### 1. `src/conn.rs` (`chromiumoxide-conn.patch`) — protocol-drift resilience
 
 When a WS text message fails to deserialize as a CDP `Message`:
 
@@ -30,6 +32,21 @@ When a WS text message fails to deserialize as a CDP `Message`:
   `CdpError::Serde`, so the pending oneshot resolves with an error instead
   of hanging. The browser supervisor relaunches on a dead connection, and
   the HTTP `TimeoutLayer` (120s) bounds the request either way.
+
+### 2. `src/handler/page.rs` + `src/page.rs` — Base64 offload (audit 42 follow-up)
+
+`PageInner::screenshot` Base64-decoded the ~300KB screenshot payload on
+the caller's async executor thread. New additive methods:
+
+- `PageInner::screenshot_base64(params)` — identical capture flow, returns
+  the raw Base64 `String` without decoding.
+- `Page::screenshot_base64(params)` — public wrapper.
+- `PageInner::screenshot` / `Page::screenshot` are unchanged in behavior
+  (they now delegate to `screenshot_base64` + decode).
+
+The bridge's capture paths (`capture_png`, `capture_jpeg`) use
+`screenshot_base64` and decode in `tokio::task::spawn_blocking`, keeping
+CPU work off the executor (audit 40 MED-6).
 
 ## Maintenance contract
 
