@@ -47,7 +47,7 @@ impl PoolState {
         self.max_contexts
     }
 
-    pub fn is_browser_connected(&self) -> bool {
+    pub fn is_browser_connected() -> bool {
         // Pool uses the main browser; always "connected" if contexts exist.
         // The actual browser liveness is managed by Browser1.
         true
@@ -151,7 +151,7 @@ impl PoolState {
         }
     }
 
-    /// Touch a context (update last_used) without returning the page.
+    /// Touch a context (update `last_used`) without returning the page.
     #[allow(dead_code)] // part of the pool API; no caller yet (audit LOW-1)
     pub fn touch(&mut self, id: &str) -> bool {
         match self.contexts.get_mut(id) {
