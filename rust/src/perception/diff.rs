@@ -18,6 +18,7 @@
 //! Elements tagged `data-vm-internal="true"` (SoM overlay, Co-Pilot HUD) are
 //! never recorded.
 
+#![allow(dead_code)] // parked: DOM-diff observer not yet wired to any route (audit LOW-1)
 use serde::Deserialize;
 
 /// One changed node in a DOM diff.
@@ -219,8 +220,7 @@ mod tests {
         assert!(d.is_empty());
         assert_eq!(d.len(), 0);
         // Forward compatibility: unknown fields from future JS are ignored.
-        let d: DomDiff =
-            serde_json::from_str(r#"{"added": [], "unknown_future": 1}"#).unwrap();
+        let d: DomDiff = serde_json::from_str(r#"{"added": [], "unknown_future": 1}"#).unwrap();
         assert!(d.is_empty());
     }
 
