@@ -141,24 +141,28 @@ fn bad_gateway(err: impl std::fmt::Display) -> Response {
         .into_response()
 }
 
-/// Evaluate GEOMETRY_JS in the page and deserialize into WindowGeometry.
+/// Evaluate `GEOMETRY_JS` in the page and deserialize into `WindowGeometry`.
 /// Always evaluated fresh, never cached across navigations or actions.
 async fn window_geometry(page: &Page) -> anyhow::Result<WindowGeometry> {
     let v = eval_json(page, GEOMETRY_JS).await?;
     serde_json::from_value::<WindowGeometry>(v)
-        .map_err(|e| anyhow::anyhow!("bad geometry shape: {}", e))
+        .map_err(|e| anyhow::anyhow!("bad geometry shape: {e}"))
 }
 
 /// Convert absolute screen coords to viewport coords using a fresh
 /// geometry snapshot (the reverse of `viewport_to_screen`).
 async fn screen_to_viewport(page: &Page, sx: f64, sy: f64) -> anyhow::Result<(f64, f64)> {
     let geom = window_geometry(page).await?;
-    Ok((sx - geom.origin_x() as f64, sy - geom.origin_y() as f64))
+    Ok((
+        sx - f64::from(geom.origin_x()),
+        sy - f64::from(geom.origin_y()),
+    ))
 }
 
 /// Verified Chrome window rect for the SEC-1 gate inside the X11 driver.
 /// Full window (including chrome); the caller clamps the target point into
 /// the inner viewport before driving.
+#[allow(clippy::cast_sign_loss)] // .max(0) guarantees non-negative before i32->u32
 fn window_rect(geom: &WindowGeometry) -> WindowRect {
     WindowRect {
         x: geom.screen_x,
@@ -169,33 +173,42 @@ fn window_rect(geom: &WindowGeometry) -> WindowRect {
 }
 
 /// Drive the REAL OS cursor to a viewport point and click, fully visible on
-/// the display. Runs the blocking XTest driver in `spawn_blocking`; the
+/// the display. Runs the blocking `XTest` driver in `spawn_blocking`; the
 /// returned coordinates are absolute screen pixels.
-async fn visible_click(vx: f64, vy: f64, geom: &WindowGeometry) -> anyhow::Result<(i32, i32)> {
+/// The display comes from config (audit 41 LOW-6): `X11Mouse` used to read
+/// ambient $DISPLAY, which silently diverges from the configured display
+/// the browser was spawned on.
+#[allow(clippy::cast_possible_truncation)] // viewport f64 -> i32 screen px; finite and range-checked downstream
+async fn visible_click(
+    display: &str,
+    vx: f64,
+    vy: f64,
+    geom: &WindowGeometry,
+) -> anyhow::Result<(i32, i32)> {
     let (sx, sy) = viewport_to_screen(vx.round() as i32, vy.round() as i32, geom);
     let (sx, sy) = clamp_to_viewport(sx, sy, geom);
     let rect = window_rect(geom);
+    let display = display.to_string();
     tokio::task::spawn_blocking(move || -> anyhow::Result<(i32, i32)> {
-        let mut mouse = X11Mouse::new()?;
+        let mut mouse = X11Mouse::new(Some(display.as_str()))?;
         mouse.set_window_rect(rect);
         mouse.click(sx, sy)?;
         Ok((sx, sy))
     })
     .await
-    .map_err(|e| anyhow::anyhow!("visible click task failed: {}", e))?
+    .map_err(|e| anyhow::anyhow!("visible click task failed: {e}"))?
 }
 
 /// Focus the element matching a selector; errors when nothing matches.
 async fn focus_element(page: &Page, selector: &str) -> anyhow::Result<()> {
     let sel_lit =
-        serde_json::to_string(selector).map_err(|e| anyhow::anyhow!("selector literal: {}", e))?;
+        serde_json::to_string(selector).map_err(|e| anyhow::anyhow!("selector literal: {e}"))?;
     let js = format!(
-        "(() => {{ const el = document.querySelector({sel}); if (!el) return null; el.focus(); return true; }})()",
-        sel = sel_lit
+        "(() => {{ const el = document.querySelector({sel_lit}); if (!el) return null; el.focus(); return true; }})()"
     );
     let v = eval_json(page, &js).await?;
     if v.is_null() {
-        anyhow::bail!("no element matches selector: {}", selector);
+        anyhow::bail!("no element matches selector: {selector}");
     }
     Ok(())
 }
@@ -204,15 +217,14 @@ async fn focus_element(page: &Page, selector: &str) -> anyhow::Result<()> {
 /// `el.value` for form controls, `el.textContent` otherwise.
 async fn read_target_value(page: &Page, selector: &str) -> anyhow::Result<String> {
     let sel_lit =
-        serde_json::to_string(selector).map_err(|e| anyhow::anyhow!("selector literal: {}", e))?;
+        serde_json::to_string(selector).map_err(|e| anyhow::anyhow!("selector literal: {e}"))?;
     let js = format!(
-        "(() => {{ const el = document.querySelector({sel}); if (!el) return null; \
-           return (el.value !== undefined ? el.value : (el.textContent || '')); }})()",
-        sel = sel_lit
+        "(() => {{ const el = document.querySelector({sel_lit}); if (!el) return null; \
+           return (el.value !== undefined ? el.value : (el.textContent || '')); }})()"
     );
     let v = eval_json(page, &js).await?;
     if v.is_null() {
-        anyhow::bail!("no element matches selector: {}", selector);
+        anyhow::bail!("no element matches selector: {selector}");
     }
     Ok(v.as_str().unwrap_or_default().to_string())
 }
@@ -222,19 +234,15 @@ async fn read_target_value(page: &Page, selector: &str) -> anyhow::Result<String
 /// read-back `el.value`.
 async fn fill_react(page: &Page, selector: &str, text: &str) -> anyhow::Result<String> {
     let sel_lit =
-        serde_json::to_string(selector).map_err(|e| anyhow::anyhow!("selector literal: {}", e))?;
-    let text_lit =
-        serde_json::to_string(text).map_err(|e| anyhow::anyhow!("text literal: {}", e))?;
+        serde_json::to_string(selector).map_err(|e| anyhow::anyhow!("selector literal: {e}"))?;
+    let text_lit = serde_json::to_string(text).map_err(|e| anyhow::anyhow!("text literal: {e}"))?;
     let js = format!(
-        "(() => {{ const el = document.querySelector({sel}); if (!el) return null; \
-           const fill = {fill_js}; return fill(el, {txt}); }})()",
-        sel = sel_lit,
-        fill_js = FILL_REACT_JS,
-        txt = text_lit
+        "(() => {{ const el = document.querySelector({sel_lit}); if (!el) return null; \
+           const fill = {FILL_REACT_JS}; return fill(el, {text_lit}); }})()"
     );
     let v = eval_json(page, &js).await?;
     if v.is_null() {
-        anyhow::bail!("no element matches selector: {}", selector);
+        anyhow::bail!("no element matches selector: {selector}");
     }
     Ok(v.as_str().unwrap_or_default().to_string())
 }
@@ -248,8 +256,9 @@ async fn click_then_type(page: &Page, selector: &str, text: &str) -> anyhow::Res
 }
 
 /// Evaluate JS and cap a string result at ~200KB so a huge page dump can
-/// never blow up the response.
-async fn eval_capped(page: &Page, js: &str) -> anyhow::Result<serde_json::Value> {
+/// never blow up the response. Shared by /browser/eval and /pool/eval
+/// (audit 41 LOW-9).
+pub(crate) async fn eval_capped(page: &Page, js: &str) -> anyhow::Result<serde_json::Value> {
     const MAX_CHARS: usize = 200_000;
     let v = eval_json(page, js).await?;
     match v {
@@ -276,10 +285,12 @@ pub async fn click(
         let (x, y) = element_center(&page, &req.selector).await?;
         if req.visible {
             let geom = window_geometry(&page).await?;
-            let (sx, sy) =
-                tokio::time::timeout(Duration::from_secs(60), visible_click(x, y, &geom))
-                    .await
-                    .map_err(|_| anyhow::anyhow!("visible click timed out"))??;
+            let (sx, sy) = tokio::time::timeout(
+                Duration::from_secs(60),
+                visible_click(&state.config.display, x, y, &geom),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("visible click timed out"))??;
             Ok((
                 StatusCode::OK,
                 Json(json!({"ok": true, "at": {"x": sx, "y": sy}, "mode": "visible"})),
@@ -301,7 +312,7 @@ pub async fn click(
     }
 }
 
-/// POST /browser/click_at — {x, y} in viewport coords. Real CDP click.
+/// POST /`browser/click_at` — {x, y} in viewport coords. Real CDP click.
 pub async fn click_at(
     State(state): State<SharedState>,
     Json(req): Json<ClickAtReq>,
@@ -323,7 +334,7 @@ pub async fn click_at(
     }
 }
 
-/// POST /browser/click_node — {backendNodeId}. DOM.resolveNode +
+/// POST /`browser/click_node` — {backendNodeId}. DOM.resolveNode +
 /// DOM.getBoxModel give the content quad; real CDP click on its center.
 pub async fn click_node(
     State(state): State<SharedState>,
@@ -350,7 +361,7 @@ pub async fn click_node(
     }
 }
 
-/// POST /browser/click_screen — {x, y} ABSOLUTE SCREEN coords. Converts to
+/// POST /`browser/click_screen` — {x, y} ABSOLUTE SCREEN coords. Converts to
 /// viewport via the fresh window offset, then real CDP click.
 pub async fn click_screen(
     State(state): State<SharedState>,
@@ -374,8 +385,8 @@ pub async fn click_screen(
     }
 }
 
-/// POST /browser/double_click — {x, y} absolute screen coords (same shape
-/// as click_screen). Converts to viewport, then real CDP double-click.
+/// POST /`browser/double_click` — {x, y} absolute screen coords (same shape
+/// as `click_screen`). Converts to viewport, then real CDP double-click.
 pub async fn double_click(
     State(state): State<SharedState>,
     Json(req): Json<ClickScreenReq>,
@@ -398,7 +409,7 @@ pub async fn double_click(
     }
 }
 
-/// POST /browser/drag — {points: [[x,y],...], draw_speed}. Points are
+/// POST /browser/drag — `{points: [[x,y],...], draw_speed}`. Points are
 /// viewport coords; the button is held through the whole path.
 pub async fn drag(State(state): State<SharedState>, Json(req): Json<DragReq>) -> impl IntoResponse {
     if req.points.is_empty() {
@@ -445,7 +456,7 @@ pub async fn drag(State(state): State<SharedState>, Json(req): Json<DragReq>) ->
     }
 }
 
-/// POST /browser/move_to — {x, y} ABSOLUTE SCREEN coords. Converts to
+/// POST /`browser/move_to` — {x, y} ABSOLUTE SCREEN coords. Converts to
 /// viewport, then moves the mouse (hover, no click).
 pub async fn move_to(
     State(state): State<SharedState>,
@@ -467,7 +478,7 @@ pub async fn move_to(
     }
 }
 
-/// POST /browser/move_to_viewport — {x, y} viewport coords. Mouse hover,
+/// POST /`browser/move_to_viewport` — {x, y} viewport coords. Mouse hover,
 /// no click.
 pub async fn move_to_viewport(
     State(state): State<SharedState>,
@@ -507,7 +518,7 @@ pub async fn scroll(
     };
     let res: anyhow::Result<(StatusCode, Json<serde_json::Value>)> = async {
         let page = active_page(&state).await?;
-        eval_json(&page, &format!("window.scrollBy(0, {})", delta)).await?;
+        eval_json(&page, &format!("window.scrollBy(0, {delta})")).await?;
         Ok((
             StatusCode::OK,
             Json(json!({"ok": true, "direction": req.direction, "amount": req.amount})),
@@ -531,9 +542,12 @@ pub async fn fill(State(state): State<SharedState>, Json(req): Json<FillReq>) ->
         if req.visible {
             let (x, y) = element_center(&page, &req.selector).await?;
             let geom = window_geometry(&page).await?;
-            tokio::time::timeout(Duration::from_secs(60), visible_click(x, y, &geom))
-                .await
-                .map_err(|_| anyhow::anyhow!("visible click timed out"))??;
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                visible_click(&state.config.display, x, y, &geom),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("visible click timed out"))??;
             mode = "visible";
         }
         focus_element(&page, &req.selector).await?;
@@ -578,7 +592,7 @@ pub async fn type_text(
     }
 }
 
-/// POST /browser/type_verified — {selector, text}. Types, reads the
+/// POST /`browser/type_verified` — {selector, text}. Types, reads the
 /// element's value back, retries once on mismatch. `verified` is true only
 /// when the read-back equals the requested text.
 pub async fn type_verified(
@@ -633,20 +647,23 @@ pub async fn press(
     }
 }
 
-/// POST /browser/wait — {selector, timeout_ms}. Polls every 250ms for the
+/// POST /browser/wait — {selector, `timeout_ms`}. Polls every 250ms for the
 /// selector to appear; an empty selector just sleeps the timeout.
 pub async fn wait(State(state): State<SharedState>, Json(req): Json<WaitReq>) -> impl IntoResponse {
     // Clamp: an unclamped timeout_ms lets a client park a worker (audit 40
-    // LOW-7). The 120s TimeoutLayer is the absolute backstop.
-    let timeout_ms = req.timeout_ms.clamp(250, 120_000);
+    // LOW-7). The 120s TimeoutLayer is the absolute backstop, so the
+    // handler ceiling sits below it: a max-timeout wait must be able to
+    // return its own honest result instead of racing the outer timeout
+    // and losing (audit 41 LOW-1).
+    let timeout_ms = req.timeout_ms.clamp(250, 110_000);
     let res: anyhow::Result<(StatusCode, Json<serde_json::Value>)> = async {
         if req.selector.is_empty() {
             tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
             return Ok((StatusCode::OK, Json(json!({"ok": true, "found": true}))));
         }
         let sel_lit = serde_json::to_string(&req.selector)
-            .map_err(|e| anyhow::anyhow!("selector literal: {}", e))?;
-        let js = format!("document.querySelector({sel}) !== null", sel = sel_lit);
+            .map_err(|e| anyhow::anyhow!("selector literal: {e}"))?;
+        let js = format!("document.querySelector({sel_lit}) !== null");
         let page = active_page(&state).await?;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
         let found = loop {
