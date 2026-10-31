@@ -76,9 +76,18 @@ impl BridgeMcp {
 
     #[tool(description = "Navigate the browser to a URL (SSRF-filtered)")]
     async fn navigate(&self, #[tool(aggr)] params: NavigateParams) -> String {
-        match crate::privy::validate_navigate_url(&params.url, &[]).await {
-            Ok(u) => json!({"ok": true, "url": u.as_str(), "validated": true}).to_string(),
-            Err(e) => json!({"ok": false, "error": e}).to_string(),
+        // Delegate to the HTTP /browser/navigate handler (audit 40 HIGH-4):
+        // this tool actually navigates now instead of merely validating.
+        use axum::response::IntoResponse;
+        let resp = crate::routes::browser::navigate(
+            axum::extract::State(self.state.clone()),
+            axum::Json(crate::routes::browser::NavigateRequest { url: params.url }),
+        )
+        .await
+        .into_response();
+        match axum::body::to_bytes(resp.into_body(), 1024 * 1024).await {
+            Ok(b) => String::from_utf8_lossy(&b).to_string(),
+            Err(e) => json!({"ok": false, "error": format!("navigate response: {e}")}).to_string(),
         }
     }
 
@@ -94,13 +103,13 @@ impl BridgeMcp {
         json!({"ok": false, "error": "diff via HTTP /browser/diff_state for now"}).to_string()
     }
 
-    #[tool(description = "Click an element by [ref=N] handle (verified)")]
+    #[tool(description = "Click an element by [ref=N] handle (via HTTP /browser/click)")]
     async fn click_ref(&self, #[tool(aggr)] params: ClickRefParams) -> String {
         json!({"ok": false, "error": "click via HTTP /browser/click for now", "ref": params.r#ref})
             .to_string()
     }
 
-    #[tool(description = "Fill a field by [ref=N] (React-aware)")]
+    #[tool(description = "Fill a field by [ref=N] (via HTTP /browser/fill)")]
     async fn fill_ref(&self, #[tool(aggr)] params: FillRefParams) -> String {
         json!({"ok": false, "error": "fill via HTTP /browser/fill for now", "ref": params.r#ref})
             .to_string()
@@ -111,7 +120,7 @@ impl BridgeMcp {
         json!({"ok": false, "error": "order via HTTP /browser/order for now", "instruction": params.instruction}).to_string()
     }
 
-    #[tool(description = "Upload a file to a file input by [ref=N]")]
+    #[tool(description = "Validate an upload path against the allowlist (upload itself via HTTP)")]
     async fn upload(&self, #[tool(aggr)] params: UploadParams) -> String {
         // Validate path via interact::upload::validate_upload_path
         let allowlist = self.state.config.upload_dirs.clone();
