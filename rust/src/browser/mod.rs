@@ -1,10 +1,21 @@
 //! Browser #1: persistent headed Chrome with the dedicated automation profile.
 //!
-//! Lifecycle: launched once at startup (after X11 readiness check), supervised
-//! by watchdog.rs. Disconnects observed via chromiumoxide's event stream
-//! (audit BUG-4: no more try/except around `_ctx.browser` which is always None).
+//! Lifecycle: the bridge OWNS its browser. [`supervise::run_supervisor`]
+//! spawns the engine at startup (after the X11 readiness check), connects
+//! the CDP driver, watches the child process, and relaunches with capped
+//! backoff when it dies. Everything engine-specific lives behind the
+//! [`backend::BrowserBackend`] trait; the core never names an engine.
+//!
+//! Health is split: the supervisor watches the *process*, `watchdog.rs`
+//! watches the *CDP session* (audit BUG-4: no more try/except around
+//! `_ctx.browser` which is always None).
 
+pub mod actions;
+pub mod attach;
+pub mod backend;
+pub mod backend_chrome;
 pub mod geometry;
+pub mod supervise;
 pub mod tabs;
 pub mod verify;
 
