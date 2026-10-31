@@ -164,6 +164,9 @@ fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
                 || v6.is_unicast_link_local()
                 || v6.is_unspecified()
                 || v6.is_multicast()
+                // fc00::/7 unique-local — the IPv6 analog of RFC1918
+                // (audit 40 MED-1)
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
         }
     }
 }
@@ -206,6 +209,14 @@ mod tests {
         assert!(validate_navigate_url("https://example.com/", &[])
             .await
             .is_ok());
+    }
+
+    #[test]
+    fn blocks_ipv6_ula() {
+        // fc00::/7 unique-local — the IPv6 analog of RFC1918 (audit 40 MED-1)
+        assert!(is_blocked_ip(&"fd00::1".parse().unwrap()));
+        assert!(is_blocked_ip(&"fc12:3456::1".parse().unwrap()));
+        assert!(!is_blocked_ip(&"2001:db8::1".parse().unwrap()));
     }
 
     #[test]
