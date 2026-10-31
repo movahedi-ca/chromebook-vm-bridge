@@ -1,0 +1,45 @@
+[Unit]
+Description=vm-bridge 2.0 (Rust) — browser automation bridge
+Documentation=https://github.com/movahedi-ca/chromebook-vm-bridge
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=notify
+# NotifyAccess: we use sd_notify for READY=1 and WATCHDOG=1
+NotifyAccess=all
+# Watchdog: 60s. Our probe loop notifies every ~13s, well under.
+# (Fixes BUG-3: WatchdogSec=30 was killing us mid-probe.)
+WatchdogSec=60
+Restart=on-failure
+RestartSec=5
+# Cap restart storms (fixes StartLimitBurst=5 suicide)
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+# Environment: API keys via EnvironmentFile (mode 600), never in the unit
+EnvironmentFile=-%h/.config/vm-bridge/env
+# VM_BRIDGE_KEYS__READ, VM_BRIDGE_KEYS__ACT, VM_BRIDGE_KEYS__ADMIN
+# VM_BRIDGE_BIND_PORT=8900 (Rust dev instance; Python holds 8899)
+
+ExecStart=%h/jobs/vm-bridge-rs/rust/target/release/vm-bridge
+WorkingDirectory=%h/jobs/vm-bridge-rs
+
+# Resource limits (replaces MemoryMax=3G guillotine)
+MemoryMax=4G
+MemoryHigh=3G
+
+# Security hardening (best-effort on user units)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/vm-bridge %h/jobs/vm-bridge-rs %h/jobs/vm-bridge
+PrivateTmp=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vm-bridge-rs
+
+[Install]
+WantedBy=default.target
