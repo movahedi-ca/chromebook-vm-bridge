@@ -7,7 +7,10 @@
 //! released pages AFTER dropping it; only map bookkeeping (prune, LRU
 //! evict, insert) happens under the lock.
 
-use crate::browser::actions::{close_page, element_center, eval_json, insert_text, mouse_click};
+use crate::browser::actions::{
+    close_page, element_center, eval_json, insert_text, mouse_click, navigate_with_mode,
+    NavWaitMode,
+};
 use crate::pool::PoolState;
 use crate::state::SharedState;
 use axum::{
@@ -45,13 +48,16 @@ pub struct ContextIdReq {
 pub struct NavigateReq {
     pub context_id: String,
     pub url: String,
+    /// Lifecycle wait mode: "networkidle" (default — historical
+    /// `page.goto()` behavior), "load", "domcontentloaded", "commit".
     #[serde(default = "default_wait_until")]
-    #[allow(dead_code)] // accepted by the API; wait strategies not implemented yet
     pub wait_until: String,
 }
 
+/// Default `wait_until` for pooled navigation: "networkidle" preserves
+/// the historical `page.goto()` behavior exactly.
 fn default_wait_until() -> String {
-    "domcontentloaded".to_string()
+    "networkidle".to_string()
 }
 
 #[derive(Deserialize)]
@@ -181,7 +187,11 @@ pub async fn acquire(
         }
     };
     // Literal-IP block patterns on the new target (audit 42 High-1).
-    crate::browser::actions::install_blocked_url_patterns(&page).await;
+    crate::browser::actions::install_blocked_url_patterns(
+        &page,
+        &state.config.blocked_resource_patterns,
+    )
+    .await;
     let (id, to_close) = {
         let mut pool = state.pool.lock().await;
         let to_close = pool.prepare_acquire();
@@ -241,9 +251,18 @@ pub async fn navigate(
         Err(r) => return r,
     };
     let nav =
-        tokio::time::timeout(Duration::from_secs(30), page.goto(validated_url.as_str())).await;
+        // `wait_until` is honored (was accepted-but-ignored; `page.goto`
+        // was fire-and-forget). Navigation failures now surface instead
+        // of silently continuing.
+        navigate_with_mode(
+            &page,
+            validated_url.as_str(),
+            NavWaitMode::parse(&req.wait_until),
+            Duration::from_secs(30),
+        )
+        .await;
     match nav {
-        Ok(Ok(_)) => {
+        Ok(()) => {
             let landed = page.url().await.ok().flatten().unwrap_or_default();
             // Re-run the SSRF firewall on the LANDED url (audit 42 High-1).
             // Fail closed: never report success on a blocked landing.
@@ -259,8 +278,14 @@ pub async fn navigate(
                 }
             }
         }
-        Ok(Err(e)) => err500(format!("navigate failed: {e}")),
-        Err(_) => err500("navigate timed out after 30s"),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("timeout") {
+                err500("navigate timed out after 30s")
+            } else {
+                err500(format!("navigate failed: {e}"))
+            }
+        }
     }
 }
 
@@ -279,7 +304,7 @@ pub async fn click(
         Ok(c) => c,
         Err(e) => return err500(format!("pool click: {e}")),
     };
-    match mouse_click(&page, x, y).await {
+    match mouse_click(&page, x, y, state.click_timing()).await {
         Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(e) => err500(format!("pool click: {e}")),
     }
@@ -436,14 +461,14 @@ pub async fn order(
             .into_response();
     };
     if req.action == "click" {
-        match mouse_click(&page, x, y).await {
+        match mouse_click(&page, x, y, state.click_timing()).await {
             Ok(()) => Json(json!({"ok": true})).into_response(),
             Err(e) => err500(format!("pool order click: {e}")),
         }
     } else {
         // fill: real click to focus, select-all on the focused field, then
         // CDP text insertion so keystroke-driven widgets react.
-        if let Err(e) = mouse_click(&page, x, y).await {
+        if let Err(e) = mouse_click(&page, x, y, state.click_timing()).await {
             return err500(format!("pool order fill focus: {e}"));
         }
         let select_js = r"(() => {
