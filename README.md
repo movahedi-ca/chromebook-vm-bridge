@@ -27,6 +27,27 @@ an SSH tunnel or the tailnet proxy.
 - Perception plane: AX snapshot with stable `[ref]` handles, screenshot
   comparison, visual assertions.
 
+## Endpoint status
+
+All route groups are implemented except the endpoints below, which return
+`501 not_implemented` (the standard shape, so contract tests can tell
+"not built" from "broken"). Do not plan workflows against them until they
+land.
+
+| Endpoint | Status |
+|---|---|
+| `/browser/*` (navigate, text, html, snapshot, state, tabs, screenshot, click, fill, type, eval, drag, scroll, press, wait, …) | implemented |
+| `/pool/*` | implemented |
+| `/lease/*`, `/health`, `/metrics`, `/ops/render_package` | implemented |
+| `/browser/fill_react`, `/browser/fill_date`, `/browser/paste_atomic` | stub (501) |
+| `/browser/restore_checkpoint`, `/browser/vault_login` | stub (501) — FormGuard is parked (see `rust/src/browser/tabs.rs`) |
+| `/browser/som_screenshot`, `/browser/diff_state` | stub (501) |
+
+MCP (`--mcp-stdio`, 10 tools): `tabs` and `upload` are functional;
+`navigate` validates the URL only; `snapshot`, `diff`, `click_ref`,
+`fill_ref`, `order`, `screenshot_marks`, and `eval` currently return
+guidance errors pointing at the equivalent HTTP endpoints.
+
 ## Files
 
 | File | Purpose |
