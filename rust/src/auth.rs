@@ -50,8 +50,7 @@ fn required_scope(req: &Request<axum::body::Body>) -> Scope {
     let template = req
         .extensions()
         .get::<axum::extract::MatchedPath>()
-        .map(|m| m.as_str())
-        .unwrap_or(req.uri().path());
+        .map_or(req.uri().path(), axum::extract::MatchedPath::as_str);
     Scope::required_for(method, template)
 }
 
