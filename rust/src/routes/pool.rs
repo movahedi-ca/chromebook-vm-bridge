@@ -8,6 +8,7 @@
 //! evict, insert) happens under the lock.
 
 use crate::browser::actions::{close_page, element_center, eval_json, insert_text, mouse_click};
+use crate::pool::PoolState;
 use crate::state::SharedState;
 use axum::{
     extract::{Query, State},
@@ -98,6 +99,17 @@ fn err500(e: impl std::fmt::Display) -> Response {
         .into_response()
 }
 
+/// 503 for "dependency down": the supervised browser is relaunching or
+/// unreachable — retryable, not a bridge bug (audit 41 LOW-10). Keeps
+/// 5xx dashboards and retry policies from conflating this with 500s.
+fn err503(e: impl std::fmt::Display) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"ok": false, "error": e.to_string()})),
+    )
+        .into_response()
+}
+
 /// Fetch a pool page, touching it for LRU/TTL. The pool lock is released
 /// before this returns; drive the page outside the lock.
 #[allow(clippy::result_large_err)] // axum Response is large by design; not worth boxing
@@ -115,7 +127,7 @@ async fn pool_page(state: &SharedState, id: &str) -> Result<Arc<Page>, Response>
 
 // ---------- handlers ----------
 
-/// POST /pool/acquire {ttl_s, trace} -> {"ok":true,"context_id"}
+/// POST /pool/acquire {`ttl_s`, trace} -> {"`ok":true,"context_id`"}
 pub async fn acquire(
     State(state): State<SharedState>,
     Json(req): Json<AcquireReq>,
@@ -126,14 +138,14 @@ pub async fn acquire(
         let b = state.browser1.lock().await;
         match b.browser() {
             Some(br) => br,
-            None => return err500("browser not connected"),
+            None => return err503("browser not connected"),
         }
     };
     // Open the page BEFORE taking the pool lock: new_page is a slow CDP
     // round-trip and the lock is never held across it (audit 40 MED-4).
     let page = match browser.new_page("about:blank").await {
         Ok(p) => Arc::new(p),
-        Err(e) => return err500(format!("pool new_page: {e}")),
+        Err(e) => return err503(format!("pool new_page: {e}")),
     };
     let (id, to_close) = {
         let mut pool = state.pool.lock().await;
@@ -147,7 +159,7 @@ pub async fn acquire(
     Json(json!({"ok": true, "context_id": id})).into_response()
 }
 
-/// POST /pool/release {context_id} -> {"ok":true}
+/// POST /pool/release {`context_id`} -> {"ok":true}
 pub async fn release(
     State(state): State<SharedState>,
     Json(req): Json<ContextIdReq>,
@@ -169,7 +181,7 @@ pub async fn release(
     }
 }
 
-/// POST /pool/navigate {context_id, url, wait_until} -> {"ok":true,"url"}
+/// POST /pool/navigate {`context_id`, url, `wait_until`} -> {"ok":true,"url"}
 pub async fn navigate(
     State(state): State<SharedState>,
     Json(req): Json<NavigateReq>,
@@ -179,29 +191,23 @@ pub async fn navigate(
         Err(r) => return r,
     };
     // SSRF guard: same validation as /browser/navigate (audit 40 HIGH-1).
-    let validated_url = match crate::privy::validate_navigate_url(&req.url, &[]).await {
+    let validated_url = match crate::privy::validated_url_or_400(&req.url).await {
         Ok(u) => u,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"ok": false, "error": e})),
-            )
-                .into_response()
-        }
+        Err(r) => return r,
     };
     let nav =
         tokio::time::timeout(Duration::from_secs(30), page.goto(validated_url.as_str())).await;
     match nav {
         Ok(Ok(_)) => match page.url().await {
             Ok(url) => Json(json!({"ok": true, "url": url.unwrap_or_default()})).into_response(),
-            Err(e) => err500(format!("navigate url read: {}", e)),
+            Err(e) => err500(format!("navigate url read: {e}")),
         },
-        Ok(Err(e)) => err500(format!("navigate failed: {}", e)),
+        Ok(Err(e)) => err500(format!("navigate failed: {e}")),
         Err(_) => err500("navigate timed out after 30s"),
     }
 }
 
-/// POST /pool/click {context_id, selector} -> {"ok":true}
+/// POST /pool/click {`context_id`, selector} -> {"ok":true}
 /// Real CDP click at the element's center (getBoundingClientRect +
 /// Input.dispatchMouseEvent), the same input path as the headed browser.
 pub async fn click(
@@ -214,15 +220,15 @@ pub async fn click(
     };
     let (x, y) = match element_center(&page, &req.selector).await {
         Ok(c) => c,
-        Err(e) => return err500(format!("pool click: {}", e)),
+        Err(e) => return err500(format!("pool click: {e}")),
     };
     match mouse_click(&page, x, y).await {
         Ok(()) => Json(json!({"ok": true})).into_response(),
-        Err(e) => err500(format!("pool click: {}", e)),
+        Err(e) => err500(format!("pool click: {e}")),
     }
 }
 
-/// POST /pool/fill {context_id, selector, text} -> {"ok":true,"value"}
+/// POST /pool/fill {`context_id`, selector, text} -> {"ok":true,"value"}
 /// Focus + set value via evaluate (fires input/change), then read back.
 pub async fn fill(State(state): State<SharedState>, Json(req): Json<FillReq>) -> impl IntoResponse {
     let page = match pool_page(&state, &req.context_id).await {
@@ -232,7 +238,7 @@ pub async fn fill(State(state): State<SharedState>, Json(req): Json<FillReq>) ->
     let sel = serde_json::to_string(&req.selector).unwrap_or_default();
     let text = serde_json::to_string(&req.text).unwrap_or_default();
     let js = format!(
-        r#"(() => {{
+        r"(() => {{
             const el = document.querySelector({sel});
             if (!el) return null;
             el.focus();
@@ -240,7 +246,7 @@ pub async fn fill(State(state): State<SharedState>, Json(req): Json<FillReq>) ->
             el.dispatchEvent(new Event('input', {{bubbles: true}}));
             el.dispatchEvent(new Event('change', {{bubbles: true}}));
             return el.value === undefined ? '' : String(el.value);
-        }})()"#
+        }})()"
     );
     match eval_json(&page, &js).await {
         Ok(v) if !v.is_null() => {
@@ -250,19 +256,20 @@ pub async fn fill(State(state): State<SharedState>, Json(req): Json<FillReq>) ->
             "pool fill: no element matches selector: {}",
             req.selector
         )),
-        Err(e) => err500(format!("pool fill: {}", e)),
+        Err(e) => err500(format!("pool fill: {e}")),
     }
 }
 
-/// POST /pool/eval {context_id, js} -> {"ok":true,"result"}
+/// POST /pool/eval {`context_id`, js} -> {"ok":true,"result"}
+/// Same 200KB result cap as /browser/eval (audit 41 LOW-9).
 pub async fn eval(State(state): State<SharedState>, Json(req): Json<EvalReq>) -> impl IntoResponse {
     let page = match pool_page(&state, &req.context_id).await {
         Ok(p) => p,
         Err(r) => return r,
     };
-    match eval_json(&page, &req.js).await {
+    match crate::routes::input::eval_capped(&page, &req.js).await {
         Ok(result) => Json(json!({"ok": true, "result": result})).into_response(),
-        Err(e) => err500(format!("pool eval: {}", e)),
+        Err(e) => err500(format!("pool eval: {e}")),
     }
 }
 
@@ -338,16 +345,16 @@ async fn resolve_order_center(
     }
     let x = v
         .get("x")
-        .and_then(|x| x.as_f64())
+        .and_then(serde_json::Value::as_f64)
         .ok_or_else(|| anyhow::anyhow!("order resolve: bad center x"))?;
     let y = v
         .get("y")
-        .and_then(|y| y.as_f64())
+        .and_then(serde_json::Value::as_f64)
         .ok_or_else(|| anyhow::anyhow!("order resolve: bad center y"))?;
     Ok(Some((x, y)))
 }
 
-/// POST /pool/order {context_id, action, text, role, value} -> {"ok":true}
+/// POST /pool/order {`context_id`, action, text, role, value} -> {"ok":true}
 /// Semantic order in a pool context: deterministic resolution, headless
 /// execution. Unknown actions and unresolvable targets are 200s with
 /// ok:false, matching the parity endpoint's contract.
@@ -365,43 +372,40 @@ pub async fn order(
     }
     let target = match resolve_order_center(&page, &req.action, &req.text, &req.role).await {
         Ok(t) => t,
-        Err(e) => return err500(format!("pool order: {}", e)),
+        Err(e) => return err500(format!("pool order: {e}")),
     };
-    let (x, y) = match target {
-        Some(c) => c,
-        None => {
-            return Json(json!({"ok": false, "error": format!("could not resolve '{}'", req.text)}))
-                .into_response()
-        }
+    let Some((x, y)) = target else {
+        return Json(json!({"ok": false, "error": format!("could not resolve '{}'", req.text)}))
+            .into_response();
     };
     if req.action == "click" {
         match mouse_click(&page, x, y).await {
             Ok(()) => Json(json!({"ok": true})).into_response(),
-            Err(e) => err500(format!("pool order click: {}", e)),
+            Err(e) => err500(format!("pool order click: {e}")),
         }
     } else {
         // fill: real click to focus, select-all on the focused field, then
         // CDP text insertion so keystroke-driven widgets react.
         if let Err(e) = mouse_click(&page, x, y).await {
-            return err500(format!("pool order fill focus: {}", e));
+            return err500(format!("pool order fill focus: {e}"));
         }
-        let select_js = r#"(() => {
+        let select_js = r"(() => {
             const el = document.activeElement;
             if (!el || !('value' in el)) return false;
             if (el.select) el.select();
             return true;
-        })()"#;
+        })()";
         if let Err(e) = eval_json(&page, select_js).await {
-            return err500(format!("pool order fill select: {}", e));
+            return err500(format!("pool order fill select: {e}"));
         }
         if let Err(e) = insert_text(&page, &req.value).await {
-            return err500(format!("pool order fill: {}", e));
+            return err500(format!("pool order fill: {e}"));
         }
         Json(json!({"ok": true})).into_response()
     }
 }
 
-/// POST /pool/snapshot {context_id} -> {"ok":true,"snapshot":[{role,name}]}
+/// POST /pool/snapshot {`context_id`} -> {"ok":true,"snapshot":[{role,name}]}
 /// Compact interactive-element list from a DOM walker.
 pub async fn snapshot(
     State(state): State<SharedState>,
@@ -443,11 +447,11 @@ pub async fn snapshot(
     })()"#;
     match eval_json(&page, js).await {
         Ok(snap) => Json(json!({"ok": true, "snapshot": snap})).into_response(),
-        Err(e) => err500(format!("pool snapshot: {}", e)),
+        Err(e) => err500(format!("pool snapshot: {e}")),
     }
 }
 
-/// GET /pool/text?context_id= -> {"ok":true,"text"}
+/// GET /`pool/text?context_id`= -> {"ok":true,"text"}
 pub async fn text(
     State(state): State<SharedState>,
     Query(q): Query<TextQuery>,
@@ -463,7 +467,7 @@ pub async fn text(
     .await
     {
         Ok(v) => Json(json!({"ok": true, "text": v.as_str().unwrap_or_default()})).into_response(),
-        Err(e) => err500(format!("pool text: {}", e)),
+        Err(e) => err500(format!("pool text: {e}")),
     }
 }
 
@@ -476,7 +480,7 @@ pub async fn status(State(state): State<SharedState>) -> impl IntoResponse {
             pruned,
             pool.context_count(),
             pool.max_contexts(),
-            pool.is_browser_connected(),
+            PoolState::is_browser_connected(),
         )
     };
     for p in pruned {
