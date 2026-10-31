@@ -1,6 +1,6 @@
-//! Set-of-Marks (SoM) visual grounding overlay (playbook §9).
+//! Set-of-Marks (`SoM`) visual grounding overlay (playbook §9).
 //!
-//! Modelled on the CAMEL Hybrid Browser Toolkit, WebVoyager, and PrivySe:
+//! Modelled on the CAMEL Hybrid Browser Toolkit, `WebVoyager`, and `PrivySe`:
 //! instead of asking a VLM to guess raw `(x, y)` pixel coordinates from an
 //! unannotated screenshot (the old `move-ai` path that estimated coordinates
 //! from a bare image), the bridge outlines every visible interactive element
@@ -47,7 +47,7 @@
 /// - Re-invoking first removes any previous overlay (idempotent).
 /// - The container is tagged `data-vm-internal="true"` so the DOM diff
 ///   observer ([`crate::perception::diff`]) ignores our own marks.
-pub const SOM_INJECT_JS: &str = r##"((nodes) => {
+pub const SOM_INJECT_JS: &str = r#"((nodes) => {
   const ID = "__vm_som_overlay";
   const old = document.getElementById(ID);
   if (old) old.remove();
@@ -78,18 +78,18 @@ pub const SOM_INJECT_JS: &str = r##"((nodes) => {
   }
   document.documentElement.appendChild(root);
   return marks;
-})"##;
+})"#;
 
 /// Removes the Set-of-Marks overlay synchronously.
 ///
 /// Returns 1 when an overlay was present, 0 otherwise. DOM removal is
 /// synchronous, so the overlay is gone in the same frame: the watched
 /// display never shows stale marks.
-pub const SOM_CLEANUP_JS: &str = r##"(() => {
+pub const SOM_CLEANUP_JS: &str = r#"(() => {
   const el = document.getElementById("__vm_som_overlay");
   if (el) { el.remove(); return 1; }
   return 0;
-})()"##;
+})()"#;
 
 #[cfg(test)]
 mod tests {
