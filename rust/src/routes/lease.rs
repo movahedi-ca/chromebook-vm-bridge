@@ -44,12 +44,14 @@ pub async fn acquire(
             .into_response(),
         Err(LeaseError::Locked { holder, ttl_left_s }) => {
             state.metrics.lock().await.rejections_423 += 1;
+            // Holder is untrusted client input: log it server-side, never
+            // reflect it to the caller (audit LOW-2).
+            tracing::info!(holder = %holder, ttl_left_s, "lease acquire rejected: locked");
             (
                 StatusCode::LOCKED,
                 Json(json!({
                     "ok": false,
                     "error": "lease_locked",
-                    "holder": holder,
                     "ttl_left_s": ttl_left_s
                 })),
             )
@@ -70,11 +72,7 @@ pub async fn renew(
 ) -> impl IntoResponse {
     let mut leases = state.leases.lock().await;
     match leases.renew(&req.lease_id, req.ttl_s) {
-        Ok(ttl) => (
-            StatusCode::OK,
-            Json(json!({"ok": true, "ttl_s": ttl})),
-        )
-            .into_response(),
+        Ok(ttl) => (StatusCode::OK, Json(json!({"ok": true, "ttl_s": ttl}))).into_response(),
         Err(LeaseError::NotFound) => (
             StatusCode::NOT_FOUND,
             Json(json!({"ok": false, "error": "lease_not_found"})),
