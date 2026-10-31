@@ -1,6 +1,6 @@
 //! Lease management (audit SEC-7).
 //!
-//! Fixes vs. Python:
+//! Fixes vs. the legacy implementation:
 //! - `GET /lease/status` NEVER returns the lease_id (was hijackable)
 //! - `acquire` returns the CLAMPED ttl (was returning unclamped request)
 //! - `POST /lease/renew` exists
@@ -17,6 +17,7 @@ const TTL_MIN: i64 = 10;
 const TTL_MAX: i64 = 3600;
 
 pub struct Lease {
+    #[allow(dead_code)] // returned on acquire; retained for audit trails
     pub id: String,
     pub client: String,
     pub expires_at: DateTime<Utc>,
@@ -35,7 +36,11 @@ impl LeaseTable {
 
     /// Acquire a lease. Returns (lease_id, clamped_ttl_s).
     /// Only one active lease at a time; second acquire gets 423.
-    pub fn acquire(&mut self, client: String, requested_ttl_s: i64) -> Result<(String, i64), LeaseError> {
+    pub fn acquire(
+        &mut self,
+        client: String,
+        requested_ttl_s: i64,
+    ) -> Result<(String, i64), LeaseError> {
         self.prune_expired();
         if let Some(existing) = self.leases.values().next() {
             return Err(LeaseError::Locked {
@@ -72,6 +77,12 @@ impl LeaseTable {
     pub fn check(&mut self, id: &str) -> bool {
         self.prune_expired();
         self.leases.contains_key(id)
+    }
+
+    /// True if any unexpired lease is currently held.
+    pub fn locked(&mut self) -> bool {
+        self.prune_expired();
+        !self.leases.is_empty()
     }
 
     /// Status for GET /lease/status — lease_id REDACTED (audit SEC-7).
@@ -113,7 +124,10 @@ pub struct LeaseStatus {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LeaseError {
-    #[error("lease held by {holder} ({ttl_left_s}s left)")]
+    // The holder's self-chosen client name is NOT surfaced to callers
+    // (audit LOW-2): it is untrusted input and a reflection surface.
+    // Only the TTL is public; the holder is logged server-side.
+    #[error("lease held ({ttl_left_s}s left)")]
     Locked { holder: String, ttl_left_s: i64 },
     #[error("lease not found or expired")]
     NotFound,
