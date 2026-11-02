@@ -16,17 +16,49 @@ if [ ! -S "/tmp/.X11-unix/X$((K+1))" ]; then
   echo "$1: display $DISP is not up - run vd-start.sh first"; exit 1
 fi
 URL="${2:-about:blank}"
+LOG="$HOME/jobs/virtual-desktops/logs/chrome-${1}.log"
+
+# Memory warning (warn, never refuse): sustained fills stay at or under 6
+# desktops; 10 is a burst. Stagger with vd-warm.sh.
+AVAIL_MB=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)
+VD_RUNNING=$(pgrep -c -f -- "--user-data-dir=.*/chrome-vd(10|[1-9]) " 2>/dev/null || echo 0)
+if [ "$AVAIL_MB" -lt 1200 ] || [ "$VD_RUNNING" -ge 6 ]; then
+  echo "warning: ${AVAIL_MB} MB available, ${VD_RUNNING} vd chromes running -"
+  echo "sustained fills stay at or under 6; 10 is a burst; stagger via vd-warm.sh"
+fi
+
 # stop any existing chrome bound to this exact profile dir (safe: our own
 # cmdline never contains the full --user-data-dir path)
 for p in $(pgrep -f -- "--user-data-dir=${PROF}"); do kill "$p" 2>/dev/null; done
 sleep 1
-rm -f "${PROF}/Default/Preferences" 2>/dev/null  # drop stale window geometry
+# Do NOT delete Default/Preferences here: the pinned --window-size /
+# --window-position flags replaced the wipe that fixed the 10x10 window.
+# If one profile is still 10x10, delete its Preferences once by hand.
 mkdir -p "$PROF"
-DISPLAY="$DISP" nohup google-chrome \
+
+# One generation of log rotation: only when the log actually passes 10 MB.
+if [ -f "$LOG" ] && [ "$(stat -c%s "$LOG")" -gt 10485760 ]; then
+  mv "$LOG" "${LOG}.1"
+fi
+
+DISPLAY="$DISP" nohup google-chrome-stable \
   --user-data-dir="$PROF" \
-  --no-first-run --no-default-browser-check \
-  --disable-dev-shm-usage \
+  --remote-debugging-address=127.0.0.1 \
   --remote-debugging-port="$PORT" \
-  --start-maximized \
-  "$URL" >"$HOME/jobs/virtual-desktops/logs/chrome-${1}.log" 2>&1 &
+  --password-store=basic \
+  --window-position=0,0 \
+  --window-size=1920,1080 \
+  --disable-gpu \
+  --disable-dev-shm-usage \
+  --disable-background-timer-throttling \
+  --disable-backgrounding-occluded-windows \
+  --disable-renderer-backgrounding \
+  --disable-ipc-flooding-protection \
+  --disable-background-networking \
+  --disable-component-update \
+  --disable-sync \
+  --disable-translate \
+  --mute-audio \
+  --no-first-run --no-default-browser-check \
+  "$URL" >"$LOG" 2>&1 &
 echo "chrome on $1 (display $DISP, debug port $PORT, profile $PROF)"
