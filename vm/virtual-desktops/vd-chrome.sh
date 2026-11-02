@@ -20,8 +20,9 @@ LOG="$HOME/jobs/virtual-desktops/logs/chrome-${1}.log"
 
 # Memory warning (warn, never refuse): sustained fills stay at or under 6
 # desktops; 10 is a burst. Stagger with vd-warm.sh.
+# Count distinct vd profiles, not processes: one desktop spawns ~10 processes.
 AVAIL_MB=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)
-VD_RUNNING=$(pgrep -c -f -- "--user-data-dir=.*/chrome-vd(10|[1-9]) " 2>/dev/null || echo 0)
+VD_RUNNING=$(pgrep -a -f -- "--user-data-dir=" 2>/dev/null | grep -oE "chrome-vd(10|[1-9]) " | sort -u | wc -l)
 if [ "$AVAIL_MB" -lt 1200 ] || [ "$VD_RUNNING" -ge 6 ]; then
   echo "warning: ${AVAIL_MB} MB available, ${VD_RUNNING} vd chromes running -"
   echo "sustained fills stay at or under 6; 10 is a burst; stagger via vd-warm.sh"

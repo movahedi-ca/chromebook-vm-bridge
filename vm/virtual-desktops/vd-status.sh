@@ -20,6 +20,6 @@ for k in $(seq 1 10); do
 done
 avail=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)
 load=$(cut -d' ' -f1-3 /proc/loadavg)
-vdcount=$(pgrep -c -f -- "--user-data-dir=.*/chrome-vd(10|[1-9]) " 2>/dev/null || echo 0)
+vdcount=$(pgrep -a -f -- "--user-data-dir=" 2>/dev/null | grep -oE "chrome-vd(10|[1-9]) " | sort -u | wc -l)
 echo "box: ${avail} MB available, load ${load}, ${vdcount} vd chromes"
 exit "$fail"
