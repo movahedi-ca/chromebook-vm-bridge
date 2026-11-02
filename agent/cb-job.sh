@@ -45,8 +45,7 @@
 #
 # Job names: letters, digits, _ and -, must start with a letter or digit.
 set -e
-CB_DIR="${CB_DIR:-$HOME/chromebook-vm}"
-SSH="$CB_DIR/cb-ssh.sh"
+SSH="$HOME/workspace/chromebook-vm/cb-ssh.sh"
 
 _name_ok() {
   case "$1" in
@@ -70,7 +69,7 @@ case "$cmd" in
   wake)
     # Network-wake the VM (shutdown state) via cb-wake.sh. Implemented by
     # the wake subagent; fails plainly if the script is missing.
-    WAKE="$CB_DIR/cb-wake.sh"
+    WAKE="$HOME/workspace/chromebook-vm/cb-wake.sh"
     if [ -x "$WAKE" ]; then
       "$WAKE"
     else
@@ -85,12 +84,12 @@ case "$cmd" in
     # bare ping. 2026-10-29: wake from full shutdown is proven impossible on
     # this box (firmware ignores the RTC alarm), so if this fails the only
     # fix is a physical press of the Chromebook's power button.
-    if "$CB_DIR/cb-job.sh" ping 2>/dev/null; then
+    if "$HOME/workspace/chromebook-vm/cb-job.sh" ping 2>/dev/null; then
       exit 0
     fi
     echo "ping failed, attempting short network wake..." >&2
-    if "$CB_DIR/cb-job.sh" wake 2 2>/dev/null; then
-      "$CB_DIR/cb-job.sh" ping
+    if "$HOME/workspace/chromebook-vm/cb-job.sh" wake 2 2>/dev/null; then
+      "$HOME/workspace/chromebook-vm/cb-job.sh" ping
     else
       echo "preflight failed: VM is down and cannot be woken over the network." >&2
       echo "Press the Chromebook's physical power button, then retry." >&2
@@ -158,13 +157,8 @@ case "$cmd" in
     # that does all three sequentially: ~0.36s. The panel still updates,
     # just without the round-trip tax.
     # shellcheck disable=SC2029
-    # set -e would abort on a non-zero remote exit before rc=$? runs
-    # (audit MED-3); the if/else form is exempt from set -e.
-    if $SSH "_tmp=\$(mktemp /tmp/cb-run.XXXXXX) || exit 96; chmod 600 \"\$_tmp\"; ~/jobs/activity-set.sh working 'run' '$cmd_short'; echo $b64 | base64 -d | timeout 600 bash > \"\$_tmp\" 2>&1; rc=\$?; cat \"\$_tmp\"; rm -f \"\$_tmp\"; ~/jobs/activity-set.sh idle 'run done' >/dev/null 2>&1 || true; exit \$rc"; then
-      rc=0
-    else
-      rc=$?
-    fi
+    $SSH "~/jobs/activity-set.sh working 'run' '$cmd_short'; echo $b64 | base64 -d | timeout 600 bash > /tmp/cb-run.out 2>&1; rc=\$?; cat /tmp/cb-run.out; rm -f /tmp/cb-run.out; ~/jobs/activity-set.sh idle 'run done' >/dev/null 2>&1 || true; exit \$rc"
+    rc=$?
     if [ "$rc" -eq 124 ]; then
       # Phase 2A item 9: timeout(1) exit 124 means the 600s cap killed it.
       # Say so explicitly instead of silently truncating. (A remote command
@@ -218,8 +212,7 @@ case "$cmd" in
     ;;
   rm)
     name="$1"; _name_ok "$name" || exit 2
-    # NOTE: no $name.pid — only .pgid is ever written (audit 41 LOW-14).
-    $SSH "rm -f ~/jobs/out/$name.pgid ~/jobs/out/$name.log ~/jobs/out/$name.exit ~/jobs/out/$name.cmd ~/jobs/out/$name.lock && echo removed:$name"
+    $SSH "rm -f ~/jobs/out/$name.pid ~/jobs/out/$name.pgid ~/jobs/out/$name.log ~/jobs/out/$name.exit ~/jobs/out/$name.cmd ~/jobs/out/$name.lock && echo removed:$name"
     ;;
   activity)
     # Show a working message on the VNC display panel (for visual sessions),
