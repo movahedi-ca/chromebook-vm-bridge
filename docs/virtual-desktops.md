@@ -15,7 +15,7 @@ down".
 ## 2. Machine context
 
 - Host: chromebook-vm, Asus Chromebook Flip C433T, Debian 13, Intel m3-8100Y,
-  8GB RAM (7.8 usable), 116GB disk. Tailnet: 100.112.27.106, ssh user `auto`
+  8GB RAM (7.8 usable), 116GB disk. Tailnet: <tailnet-ip>, ssh user `auto`
   (passwordless sudo). Reached from the agent VM via
   `~/workspace/chromebook-vm/cb-ssh.sh`.
 - Display layout BEFORE this work (all preserved, never touched):
@@ -107,7 +107,7 @@ Chrome:     ./cb-ssh.sh "~/jobs/virtual-desktops/vd-chrome.sh vd5 <url>"
 
 View a desktop over VNC (VNC is localhost-bound on the VM, same as the
 existing :5902 convention; tunnel first):
-  ssh -L 5905:127.0.0.1:5905 auto@100.112.27.106   # then VNC to localhost:5905 for vd3
+  ssh -L 5905:127.0.0.1:5905 auto@<tailnet-ip>   # then VNC to localhost:5905 for vd3
 Screenshot without VNC:
   ./cb-ssh.sh "DISPLAY=:4 scrot -z /tmp/vd3.png"
 

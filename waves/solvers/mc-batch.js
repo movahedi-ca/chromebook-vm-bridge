@@ -28,11 +28,13 @@
 // 6. pool click with colon-ids breaks CSS escaping: use getElementById().click() in eval.
 
 globalThis.MC = (function () {
+  // PII note: <APPLICANT_*> placeholders must be filled from the operator's
+// records before running. Real values are never committed to the repo.
   const STD = {
     firstName: 'Mohammad', middleName: 'Hossein', lastName: 'Movahedi',
     email: 'm.h.movahedi97@gmail.com',
-    phone: '+1 (437) 256-2256',
-    address: '36 Elm Dr W, Unit 3203', city: 'Mississauga', postal: 'L5B 0N3',
+    phone: '<APPLICANT_PHONE>',
+    address: '<APPLICANT_ADDRESS>', city: 'Mississauga', postal: 'L5B 0N3',
     country: 'Canada',
   };
 

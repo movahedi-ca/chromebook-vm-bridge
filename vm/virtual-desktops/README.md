@@ -48,7 +48,7 @@ Run from the agent VM via:
 
 VNC is localhost-bound on the VM (same as the existing :5902 setup).
 From the agent VM, tunnel then connect, e.g. for vd3:
-  ssh -L 5905:127.0.0.1:5905 auto@100.112.27.106
+  ssh -L 5905:127.0.0.1:5905 auto@<tailnet-ip>
 Screenshot without VNC:
   ./cb-ssh.sh "DISPLAY=:4 scrot -z /tmp/vd3.png"
 

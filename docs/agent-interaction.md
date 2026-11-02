@@ -2,7 +2,7 @@
 
 The chromebook-vm is Mohammad's always-on physical machine: an Asus
 Chromebook Flip C433T (Intel Core m3-8100Y, 8GB RAM) running Debian 13,
-on the tailnet at `100.112.27.106` as user `auto`. Agents never touch it
+on the tailnet at `<tailnet-ip>` as user `auto`. Agents never touch it
 directly as a second brain. The standing shape is a three-sided protocol:
 
 1. **The VM executes.** Deterministic scripts and the browser bridge do

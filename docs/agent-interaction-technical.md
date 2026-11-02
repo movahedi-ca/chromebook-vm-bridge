@@ -7,7 +7,7 @@ No secrets live here; placeholders are shown as `<...>`.
 ## Machine
 
 - Host: Asus Chromebook Flip C433T, Debian 13, user `auto`
-- Tailnet: `100.112.27.106` (agents only; never the public Funnel URL)
+- Tailnet: `<tailnet-ip>` (agents only; never the public Funnel URL)
 - SSH: `~/.ssh/id_ed25519`, multiplexed (ControlMaster/ControlPersist
   600s), host key pinned at `~/.ssh/known_hosts.d/chromebook-vm-pinned`
 - Proxy: hatch-managed Tailscale egress; auth minted fresh per call by

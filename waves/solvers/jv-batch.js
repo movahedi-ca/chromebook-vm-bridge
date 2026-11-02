@@ -5,12 +5,14 @@
 
 globalThis.JV = (function () {
   // Standard answers (honest, per GOAL.md)
+  // PII note: <APPLICANT_*> placeholders must be filled from the operator's
+// records before running. Real values are never committed to the repo.
   const STD = {
     firstName: 'Mohammad',
     lastName: 'Movahedi',
-    address: '36 Elm Dr W, Unit 3203',
+    address: '<APPLICANT_ADDRESS>',
     email: 'm.h.movahedi97@gmail.com',
-    phone: '4372562256', // digits-only (Workday lesson; Jobvite accepts it too)
+    phone: '<APPLICANT_PHONE_DIGITS>', // digits-only (Workday lesson; Jobvite accepts it too)
     city: 'Mississauga',
     province: 'Ontario',
     country: 'Canada',

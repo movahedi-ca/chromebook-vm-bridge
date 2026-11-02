@@ -10,13 +10,15 @@
 
 globalThis.CW = (function () {
   // Standard answers (honest, per GOAL.md)
+  // PII note: <APPLICANT_*> placeholders must be filled from the operator's
+// records before running. Real values are never committed to the repo.
   const STD = {
     firstName: 'Mohammad',
     lastName: 'Movahedi',
     email: 'm.h.movahedi97@gmail.com',
-    phone: '4372562256',
-    phoneIntl: '+14372562256',
-    address: '36 Elm Dr W, Unit 3203',
+    phone: '<APPLICANT_PHONE_DIGITS>',
+    phoneIntl: '<APPLICANT_PHONE_INTL>',
+    address: '<APPLICANT_ADDRESS>',
     city: 'Mississauga',
     province: 'Ontario',
     postal: 'L5B 0N3',

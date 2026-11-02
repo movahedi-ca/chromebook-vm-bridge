@@ -3,11 +3,13 @@
 // Timing: 109-146s per application (beating OLG 147s final)
 
 // Standard answers (honest, per GOAL.md)
-const STD = {
+// PII note: <APPLICANT_*> placeholders must be filled from the operator's
+// records before running. Real values are never committed to the repo.
+  const STD = {
   lastName: 'Movahedi',
-  address: '36 Elm Dr W, Unit 3203',
+  address: '<APPLICANT_ADDRESS>',
   postal: 'L5B 0N3',
-  phone: '4372562256', // digits-only, Workday rejects formatted
+  phone: '<APPLICANT_PHONE_DIGITS>', // digits-only, Workday rejects formatted
   howHeard: 'Corporate Website',
   eligible: 'Yes',
   family: 'No',

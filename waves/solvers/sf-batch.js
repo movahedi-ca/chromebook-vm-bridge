@@ -23,7 +23,9 @@
 // (bare auroramj.jobs2web.com 301s to sap.com; correct SNI serves the site)
 
 // Standard honest answers (per GOAL.md)
-const SF_STD = {
+const SF_// PII note: <APPLICANT_*> placeholders must be filled from the operator's
+// records before running. Real values are never committed to the repo.
+  STD = {
   howHeard: 'Company Website',
   travel: '0 - 10%',
   authorized: 'Yes',
@@ -35,7 +37,7 @@ const SF_STD = {
   signature: 'Mohammad Movahedi',
   referred: 'No',
   related: 'No',
-  address: '36 Elm Dr W, Unit 3203',
+  address: '<APPLICANT_ADDRESS>',
   city: 'Mississauga',
   postal: 'L5B 0N3',
   email: 'm.h.movahedi97@gmail.com',

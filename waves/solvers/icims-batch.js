@@ -5,13 +5,15 @@
 
 globalThis.ICIMS = (function () {
   // Standard answers (honest, per GOAL.md)
+  // PII note: <APPLICANT_*> placeholders must be filled from the operator's
+// records before running. Real values are never committed to the repo.
   const STD = {
     firstName: 'Mohammad',
     lastName: 'Movahedi',
-    address: '36 Elm Dr W',
+    address: '<APPLICANT_ADDRESS>',
     unit: 'Unit 3203',
     email: 'm.h.movahedi97@gmail.com',
-    phone: '4372562256', // digits-only
+    phone: '<APPLICANT_PHONE_DIGITS>', // digits-only
     city: 'Mississauga',
     province: 'Ontario',
     postal: 'L5B 0N3',
