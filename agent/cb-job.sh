@@ -15,6 +15,11 @@
 #                                    shutdown on this firmware; fails plainly)
 #   cb-job.sh ls                  -> running|done per background job
 #   cb-job.sh fetch URL [MAXCHARS]-> JSON {url,title,description,text,links}
+#   cb-job.sh fetch-lp URL        -> Lightpanda pilot (A2): isolated unsigned
+#                                    fetch via /usr/local/libexec/lightpanda/
+#                                    lightpanda-fetch. stdout: markdown dump;
+#                                    stderr: JSON result line. Explicit opt-in
+#                                    only; allowlisted hosts; no auth/cookies.
 #   cb-job.sh run 'CMD'           -> run CMD on the VM (600s cap), stdout back
 #   cb-job.sh bg NAME 'CMD'       -> start background job; poll with status/get
 #   cb-job.sh status NAME         -> running | done | unknown  (cheap poll)
@@ -128,6 +133,22 @@ case "$cmd" in
     set -e
     $SSH "~/jobs/activity-set.sh idle 'fetched'" || true
     exit "$fetch_rc"
+    ;;
+  fetch-lp)
+    # Lightpanda pilot (playbook A2): isolated unsigned fetch. URL travels
+    # base64-encoded like fetch; the wrapper validates, sandboxes, and fetches.
+    # stdout: markdown dump. stderr: JSON result line {ok,category,...}.
+    url="$1"; [ -n "$url" ] || { echo "usage: cb-job.sh fetch-lp URL" >&2; exit 2; }
+    b64=$(printf '%s' "$url" | base64 -w0)
+    url_short=$(printf '%s' "$url" | cut -c1-60 | tr -d "'")
+    # shellcheck disable=SC2029
+    $SSH "~/jobs/activity-set.sh working 'fetch-lp' '$url_short'"
+    # cb-ssh swallows remote stderr on success, so the wrapper's JSON result
+    # line is republished here on stdout as "LP_RESULT {...}" ahead of the
+    # markdown. Parse the first line for metrics; the rest is the dump.
+    # shellcheck disable=SC2029
+    $SSH "echo $b64 | base64 -d > /tmp/cb-lp-url.txt && /usr/local/libexec/lightpanda/lightpanda-fetch \"\$(cat /tmp/cb-lp-url.txt)\" > /tmp/cb-lp-out.md 2> /tmp/cb-lp-out.err; rc=\$?; printf 'LP_RESULT '; cat /tmp/cb-lp-out.err | grep -m1 '^{\"ok\"' || echo '{\"ok\":false,\"category\":\"no-result\"}'; cat /tmp/cb-lp-out.md; rm -f /tmp/cb-lp-url.txt /tmp/cb-lp-out.md /tmp/cb-lp-out.err; exit \$rc"
+    $SSH "~/jobs/activity-set.sh idle 'fetched-lp'"
     ;;
   run)
     b64=$(printf '%s' "$*" | base64 -w0)

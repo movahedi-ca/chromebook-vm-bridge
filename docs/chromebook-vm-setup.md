@@ -1,7 +1,7 @@
 # Chromebook VM setup (overall)
 
 How the host machine behind `vm-bridge` is put together. This documents the
-current production setup (October 2026) so the box can be rebuilt or audited.
+current production setup (November 2026) so the box can be rebuilt or audited.
 No secrets live in this repo: the API key is deployed out-of-band (see
 "Secrets" below) and values are shown as `<placeholders>`.
 
@@ -38,6 +38,13 @@ No secrets live in this repo: the API key is deployed out-of-band (see
   `--password-store=basic`, so anything in Login Data sits in a plaintext
   SQLite file readable by anyone with bridge/filesystem access. Cookies
   (signed-in sessions) are what the seed is for; saved passwords stay in
+- Virtual desktops (Nov 2026): vd1..vd10 give parallel headed sessions
+  beyond the bridge's own `:1` Chrome — Xvfb `:2`..`:11`, VNC `5903`..`5912`,
+  CDP `9333`..`9342`, one Chrome profile each (`~/.config/chrome-vdK`).
+  Managed with `~/jobs/vd-start.sh [N]` / `vd-stop.sh [N|all]` /
+  `~/jobs/virtual-desktops/vd-chrome.sh vdK [url]`. Sustained parallel work
+  stays at 6 or fewer; 10 is for short bursts. Full writeup in
+  `docs/virtual-desktops.md` and `vm/virtual-desktops/README.md`.
   the main profile only. This rule applies to future seeds — the live
   automation profile is left untouched.
 - The spawn/supervise layer is a **swappable backend** behind a
